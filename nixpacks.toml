@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python313", "python313Packages.pip"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python run.py"

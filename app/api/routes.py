@@ -190,3 +190,55 @@ async def webhook_user_stats():
     """User counts by subscription tier — for the RainX admin dashboard."""
     from app.storage.user_repo import get_all_users_count
     return await get_all_users_count()
+
+
+# ─── Price & Candle data (yfinance — no API key, no rate limits) ───────────────
+
+@router.get("/price")
+async def live_price(symbol: str = Query(...)):
+    """Latest price for any supported symbol via yfinance."""
+    import asyncio
+    import yfinance as yf
+    from app.data_providers.yfinance_provider import _SYMBOL_MAP
+
+    ticker_sym = _SYMBOL_MAP.get(symbol.upper())
+    if not ticker_sym:
+        raise HTTPException(status_code=404, detail=f"Symbol {symbol!r} not supported")
+
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            t = yf.Ticker(ticker_sym)
+            return t.fast_info.last_price
+        price = await loop.run_in_executor(None, _fetch)
+        return {"price": price, "symbol": symbol.upper()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/candles")
+async def candle_series(symbol: str = Query(...), interval: str = Query(default="1h")):
+    """
+    OHLCV series via yfinance.
+    Response shape matches the old Twelve Data shape so the chart works unchanged:
+    { values: [{ datetime, open, high, low, close }] }  newest-first
+    """
+    provider = get_provider()
+    # Normalise interval labels from either Twelve Data or RainX keys
+    tf_alias = {"60min": "1h", "240min": "4h", "1day": "1d", "daily": "1d"}
+    tf = tf_alias.get(interval, interval)
+    try:
+        candles = await provider.get_candles(symbol.upper(), tf, limit=60)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    values = [
+        {
+            "datetime": c.timestamp.isoformat(),
+            "open": c.open,
+            "high": c.high,
+            "low": c.low,
+            "close": c.close,
+        }
+        for c in reversed(candles)  # newest first
+    ]
+    return {"values": values, "symbol": symbol.upper(), "interval": interval}

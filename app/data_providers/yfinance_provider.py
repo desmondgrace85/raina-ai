@@ -114,12 +114,15 @@ class YFinanceProvider(DataProvider):
                 interval=yf_interval,
                 progress=False,
                 auto_adjust=True,
-                multi_level_index=False,
             ),
         )
 
         if df is None or df.empty:
             return []
+
+        # Older yfinance returns a MultiIndex columns (Price, Ticker) — flatten it
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         if timeframe == "4h":
             df = _resample_to_4h(df)
