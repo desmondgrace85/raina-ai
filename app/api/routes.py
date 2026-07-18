@@ -16,10 +16,6 @@ from app.scanner import multi_market_scanner
 router = APIRouter()
 
 
-@router.get("/health")
-async def health():
-    return {"status": "ok"}
-
 # Set by app.main at startup — see get_provider() below.
 _provider: DataProvider | None = None
 

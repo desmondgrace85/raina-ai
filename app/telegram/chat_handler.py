@@ -220,10 +220,9 @@ async def _fetch_signal_analysis(asset: str) -> str:
     """Run the long-term engine on a specific asset and return a conversational answer."""
     try:
         from app.scanner import multi_market_scanner
-        from app.data.provider_factory import get_provider
-        from app.config import settings
+        from app.api.routes import get_provider
 
-        provider = get_provider(settings.data_provider)
+        provider = get_provider()
         signals = await multi_market_scanner.scan(
             provider, [asset], engine="long_term",
             timeframe="1h", only_actionable=False,
@@ -234,16 +233,35 @@ async def _fetch_signal_analysis(asset: str) -> str:
         s = signals[0]
         direction = s.direction.value  # BUY / SELL / HOLD
         conf      = s.confidence
-        summary   = getattr(s, "summary", "") or ""
+        explanation = s.explanation or ""
 
         icon = "🟢" if direction == "BUY" else "🔴" if direction == "SELL" else "⚪"
+
+        # Try AI-enhanced commentary first
+        try:
+            from app.analysis.ai_enhancer import ai_chat_response
+            ai_reply = await ai_chat_response(
+                user_message=f"Give me your analysis on {asset}",
+                symbol=asset,
+                signal_context=(
+                    f"Signal: {direction} | Confidence: {conf:.0f}%\n"
+                    f"Analysis: {explanation}"
+                ),
+                user_name="trader",
+            )
+            if ai_reply:
+                return ai_reply
+        except Exception:
+            pass
+
+        # Fallback structured reply
         opinion = (
             f"Based on my current analysis of *{asset}*:\n\n"
             f"{icon} Direction: *{direction}*\n"
             f"📊 Confidence: `{conf:.0f}%`\n"
         )
-        if summary:
-            opinion += f"\n📝 {summary}\n"
+        if explanation:
+            opinion += f"\n📝 {explanation[:300]}\n"
 
         if direction == "HOLD":
             opinion += (
@@ -251,9 +269,15 @@ async def _fetch_signal_analysis(asset: str) -> str:
                 "I'd wait for a stronger setup before entering. Patience is a strategy too."
             )
         elif conf >= 75:
-            opinion += f"\n✅ This is a *strong* {direction} setup. Risk management still applies — don't over-leverage."
+            opinion += (
+                f"\n✅ This is a *strong* {direction} setup. "
+                "Risk management still applies — don't over-leverage."
+            )
         else:
-            opinion += f"\n⚠️ Confidence is moderate. Consider waiting for a cleaner entry or reducing position size."
+            opinion += (
+                "\n⚠️ Confidence is moderate. Consider waiting for a cleaner entry "
+                "or reducing position size."
+            )
 
         opinion += f"\n\n_Use /signal {asset} for the full breakdown with TP/SL levels._"
         return opinion
@@ -517,7 +541,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(cmds, parse_mode="Markdown")
         return
 
-    # ── 9. Fallback ───────────────────────────────────────────────────────────
+    # ── 9. AI fallback — let GPT handle anything we didn't pattern-match ────
     if not logged:
         await update.message.reply_text(
             "I'm *Raina AI* 🤖 — your intelligent trading assistant.\n"
@@ -526,6 +550,22 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Try AI response first (works for any trading question, including edge cases)
+    try:
+        from app.analysis.ai_enhancer import ai_chat_response
+        ai_reply = await ai_chat_response(
+            user_message=text,
+            symbol=None,
+            signal_context=None,
+            user_name=first_name,
+        )
+        if ai_reply:
+            await update.message.reply_text(ai_reply, parse_mode="Markdown")
+            return
+    except Exception as e:
+        logger.debug(f"[chat] AI fallback error: {e}")
+
+    # Hard fallback when OpenAI isn't configured
     fallbacks = [
         f"Not sure I follow, {first_name} — but I'm here for anything trading-related! 📊\n"
         "Try: _\"When is CPI?\"_, _\"Should I buy EURUSD?\"_, or /scan.",

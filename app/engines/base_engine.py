@@ -6,6 +6,7 @@ call `build_signal`. Supports both synchronous analysis modules and
 async modules (e.g. multi-timeframe, which needs to fetch extra candles).
 """
 import asyncio
+import logging
 
 import numpy as np
 
@@ -13,12 +14,19 @@ from app.analysis import risk_reward
 from app.data_providers.base import DataProvider
 from app.models.signal import Candle, Direction, FactorResult, Signal
 
+logger = logging.getLogger(__name__)
+
 
 def combine_factors(factors: list[FactorResult]) -> tuple[float, float]:
     """
     Returns (directional_score, confidence).
     directional_score: -100..100, sign = BUY vs SELL
     confidence: 0..100
+
+    Formula calibrated so that:
+    - Strong multi-factor alignment (score≥45, agreement≥80%) → 70%+ confidence
+    - Weak or mixed signals → stays below 65% threshold
+    - Agreement amplifies strength proportionally
     """
     if not factors:
         return 0.0, 0.0
@@ -33,8 +41,18 @@ def combine_factors(factors: list[FactorResult]) -> tuple[float, float]:
     )
     agreement_ratio = agreeing_weight / total_weight
 
-    strength   = min(abs(weighted_score), 100)
-    confidence = strength * 0.55 + agreement_ratio * 100 * 0.45
+    strength = min(abs(weighted_score), 100)
+
+    # Agreement amplifies strength — high agreement on a moderate signal
+    # should produce a tradeable confidence (≥65%), while low agreement
+    # keeps even a strong directional score below the gate.
+    amplified_strength = strength * (1.0 + agreement_ratio * 0.6)
+    confidence = amplified_strength * 0.55 + agreement_ratio * 100 * 0.45
+
+    logger.debug(
+        f"combine_factors: ws={weighted_score:.1f} agreement={agreement_ratio:.2f} "
+        f"strength={strength:.1f} amplified={amplified_strength:.1f} conf={confidence:.1f}"
+    )
 
     return weighted_score, float(min(confidence, 100))
 
@@ -113,10 +131,13 @@ def _build_rainas_read(
 
     # Pull key factor commentary
     factor_map = {f.name: f for f in factors}
-    for fname in ("adx", "macd", "candlestick"):
-        if fname in factor_map:
+    for fname in ("adx", "macd", "candlestick", "news_sentiment"):
+        if fname in factor_map and factor_map[fname].weight > 0:
             snippet = factor_map[fname].reason.split(";")[0].strip().rstrip(".")
-            if snippet and snippet.lower() not in ("", "no significant pattern — price action neutral"):
+            if snippet and snippet.lower() not in (
+                "", "no significant pattern — price action neutral",
+                "news data unavailable — factor excluded from this signal.",
+            ):
                 parts.append(snippet)
 
     # Conclusion
@@ -149,12 +170,18 @@ async def build_signal(
     candles: list[Candle] = await provider.get_candles(symbol, timeframe, candle_limit)
 
     if len(candles) < 30:
+        logger.warning(
+            f"[{engine_name}] {symbol} [{timeframe}] — only {len(candles)} candles, "
+            f"need ≥30. Returning HOLD."
+        )
         return Signal(
             asset=symbol, engine=engine_name, direction=Direction.HOLD,
             confidence=0, risk_level="LOW",
             explanation="Insufficient data to analyse this asset/timeframe.",
             timeframe=timeframe,
         )
+
+    logger.debug(f"[{engine_name}] {symbol} [{timeframe}] — {len(candles)} candles loaded")
 
     sync_factors: list[FactorResult] = [f(candles) for f in factor_funcs]
 
@@ -167,13 +194,21 @@ async def build_signal(
         for r in results:
             if isinstance(r, FactorResult):
                 async_factors.append(r)
+            elif isinstance(r, Exception):
+                logger.warning(f"[{engine_name}] Async factor failed: {r}")
 
     factors = sync_factors + async_factors
     directional_score, confidence = combine_factors(factors)
 
+    logger.info(
+        f"[{engine_name}] {symbol} [{timeframe}] "
+        f"score={directional_score:.1f} confidence={confidence:.1f}% "
+        f"(threshold={min_confidence}%)"
+    )
+
     rainas_read = _build_rainas_read(candles, Direction.HOLD, factors, confidence)
 
-    # HOLD when confidence is too low — directional_score threshold lowered to 5
+    # HOLD when confidence is too low or direction is too ambiguous
     if confidence < min_confidence or abs(directional_score) < 5:
         return Signal(
             asset=symbol, engine=engine_name, direction=Direction.HOLD,

@@ -30,13 +30,22 @@ async def analyze(
             get_asset_news(symbol),
         )
         score, explanation = compute_news_bias(symbol, events, headlines)
-        logger.debug(f"[news] {symbol} score={score:.1f} events={len(events)} headlines={len(headlines)}")
+        logger.debug(
+            f"[news] {symbol} score={score:.1f} "
+            f"events={len(events)} headlines={len(headlines)}"
+        )
         return FactorResult(
             name="news_sentiment",
             score=score,
             weight=weight,
-            explanation=explanation,
+            reason=explanation,   # ← was wrongly named 'explanation', must be 'reason'
         )
     except Exception as e:
         logger.warning(f"news_sentiment factor failed for {symbol}: {e}")
-        return FactorResult(name="news_sentiment", score=0.0, weight=0.0, explanation="News data unavailable.")
+        # Weight 0 so it doesn't drag confidence down — but doesn't help either
+        return FactorResult(
+            name="news_sentiment",
+            score=0.0,
+            weight=0.0,
+            reason="News data unavailable — factor excluded from this signal.",
+        )
