@@ -94,9 +94,11 @@ async def startup():
             await mark_disconnected_stale(minutes=5)
     asyncio.create_task(_stale_sweeper())
 
-    # Start Telegram bot (silently skipped if token not set)
-    from app.telegram.bot import start_bot
-    await start_bot(provider)
+    # Start Telegram bot in background so healthcheck isn't blocked
+    async def _start_bot_bg():
+        from app.telegram.bot import start_bot
+        await start_bot(provider)
+    asyncio.create_task(_start_bot_bg())
 
 
 @app.on_event("shutdown")
