@@ -188,26 +188,22 @@ async def webhook_user_stats():
     return await get_all_users_count()
 
 
-# ─── Price & Candle data (yfinance — no API key, no rate limits) ───────────────
+# ─── Price & Candle data ────────────────────────────────────────────────────
 
 @router.get("/price")
 async def live_price(symbol: str = Query(...)):
-    """Latest price for any supported symbol via yfinance."""
-    import asyncio
-    import yfinance as yf
-    from app.data_providers.yfinance_provider import _SYMBOL_MAP
-
-    ticker_sym = _SYMBOL_MAP.get(symbol.upper())
-    if not ticker_sym:
-        raise HTTPException(status_code=404, detail=f"Symbol {symbol!r} not supported")
-
-    loop = asyncio.get_event_loop()
+    """Latest price for any supported symbol via the active data provider."""
+    provider = get_provider()
+    sym = symbol.upper()
     try:
-        def _fetch():
-            t = yf.Ticker(ticker_sym)
-            return t.fast_info.last_price
-        price = await loop.run_in_executor(None, _fetch)
-        return {"price": price, "symbol": symbol.upper()}
+        # Get the most recent candle — works for Binance, Yahoo v8, etc.
+        candles = await provider.get_candles(sym, "1m", limit=1)
+        if not candles:
+            # Fallback to 5m if 1m unavailable (e.g. forex on weekends)
+            candles = await provider.get_candles(sym, "5m", limit=1)
+        if not candles:
+            raise ValueError(f"No price data returned for {sym}")
+        return {"price": candles[-1].close, "symbol": sym}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -31,9 +31,11 @@ app = FastAPI(
 
 
 def _build_provider() -> DataProvider:
-    if settings.data_provider == "yfinance":
-        from app.data_providers.yfinance_provider import YFinanceProvider
-        return YFinanceProvider()
+    if settings.data_provider in ("yfinance", "multi"):
+        # MultiProvider uses Binance for crypto + Yahoo v8 for forex/gold.
+        # Works from Railway cloud IPs (yfinance alone is IP-blocked by Yahoo).
+        from app.data_providers.multi_provider import MultiProvider
+        return MultiProvider()
     if settings.data_provider == "mock":
         from app.data_providers.mock_provider import MockDataProvider
         return MockDataProvider()
