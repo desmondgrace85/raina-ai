@@ -2,9 +2,10 @@
 Cloud-safe market data provider for Raina AI.
 
 Yahoo Finance's yfinance library is blocked from cloud IPs (Railway, Heroku,
-Render, etc.) because they share IP ranges with scrapers. This provider uses:
+Render, etc.) because they share IP ranges with scrapers. Binance is also
+geo-restricted from US-region cloud IPs. This provider uses:
 
-  • Binance REST API  — crypto (BTC, ETH, SOL, …)  — free, no auth, cloud-safe
+  • OKX REST API      — crypto (BTC, ETH, SOL, …)  — free, no auth, cloud-safe
   • Yahoo Finance v8  — forex, gold, commodities     — direct HTTP with browser
                          session + crumb token (bypasses the yfinance block)
 
@@ -28,21 +29,26 @@ logger = logging.getLogger(__name__)
 
 # ── Symbol maps ─────────────────────────────────────────────────────────────
 
-_BINANCE_SYMBOLS: dict[str, str] = {
-    "BTCUSD": "BTCUSDT",
-    "ETHUSD": "ETHUSDT",
-    "BNBUSD": "BNBUSDT",
-    "SOLUSD": "SOLUSDT",
-    "XRPUSD": "XRPUSDT",
-    "ADAUSD": "ADAUSDT",
-    "DOTUSD": "DOTUSDT",
-    "MATICUSD": "MATICUSDT",
-    "LINKUSD": "LINKUSDT",
+_OKX_SYMBOLS: dict[str, str] = {
+    "BTCUSD":   "BTC-USDT",
+    "ETHUSD":   "ETH-USDT",
+    "BNBUSD":   "BNB-USDT",
+    "SOLUSD":   "SOL-USDT",
+    "XRPUSD":   "XRP-USDT",
+    "ADAUSD":   "ADA-USDT",
+    "DOTUSD":   "DOT-USDT",
+    "MATICUSD": "MATIC-USDT",
+    "LINKUSD":  "LINK-USDT",
 }
 
-_BINANCE_INTERVALS: dict[str, str] = {
-    "1m": "1m", "5m": "5m", "15m": "15m",
-    "1h": "1h", "4h": "4h", "1d": "1d",
+# OKX bar values — note 1H/4H/1D are uppercase
+_OKX_INTERVALS: dict[str, str] = {
+    "1m":  "1m",
+    "5m":  "5m",
+    "15m": "15m",
+    "1h":  "1H",
+    "4h":  "4H",
+    "1d":  "1D",
 }
 
 _YAHOO_SYMBOLS: dict[str, str] = {
@@ -150,26 +156,32 @@ def _get_yahoo_crumb() -> str:
     return ""
 
 
-# ── Binance fetcher ──────────────────────────────────────────────────────────
+# ── OKX fetcher ──────────────────────────────────────────────────────────────
 
-def _fetch_binance_sync(symbol: str, interval: str, limit: int) -> list[Candle]:
+def _fetch_okx_sync(inst_id: str, bar: str, limit: int) -> list[Candle]:
     """
-    Fetch klines from Binance public REST API.
-    Returns up to `limit` candles newest-last.
+    Fetch OHLCV candles from OKX public REST API (no auth, no geo-block).
+    OKX returns data newest-first; we reverse to oldest-first before returning.
+    Response columns: [ts_ms, open, high, low, close, vol_base, volCcy, volCcyQuote, confirm]
     """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {
-        "symbol":   symbol,
-        "interval": interval,
-        "limit":    min(limit + 50, 1000),
-    }
+    url = "https://www.okx.com/api/v5/market/candles"
+    # OKX max limit per request is 300
+    fetch_limit = min(limit + 50, 300)
+    params = {"instId": inst_id, "bar": bar, "limit": fetch_limit}
+
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
 
+    body = r.json()
+    if body.get("code") != "0":
+        raise ValueError(f"OKX API error: {body.get('msg', 'unknown')} (code {body.get('code')})")
+
+    data = body.get("data", [])
+
     candles: list[Candle] = []
-    for row in r.json():
-        ts = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
+    for row in reversed(data):  # OKX newest-first → reverse to oldest-first
         try:
+            ts = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
             candles.append(Candle(
                 timestamp=ts,
                 open=float(row[1]),
@@ -193,7 +205,7 @@ def _parse_yahoo_chart(j: dict) -> pd.DataFrame:
         error = j.get("chart", {}).get("error") or {}
         raise ValueError(f"Yahoo v8 empty result — error: {error}")
 
-    result    = results[0]
+    result     = results[0]
     timestamps = result.get("timestamp") or []
     quote      = (result.get("indicators", {}).get("quote") or [{}])[0]
 
@@ -304,11 +316,11 @@ def _df_to_candles(df: pd.DataFrame, limit: int) -> list[Candle]:
 
 class MultiProvider(DataProvider):
     """
-    Cloud-safe market data: Binance for crypto, Yahoo Finance v8 for forex/gold.
+    Cloud-safe market data: OKX for crypto, Yahoo Finance v8 for forex/gold.
     """
 
     async def get_available_symbols(self) -> list[str]:
-        return list(_BINANCE_SYMBOLS) + list(_YAHOO_SYMBOLS)
+        return list(_OKX_SYMBOLS) + list(_YAHOO_SYMBOLS)
 
     async def get_candles(
         self, symbol: str, timeframe: str, limit: int = 200
@@ -316,19 +328,19 @@ class MultiProvider(DataProvider):
         sym  = symbol.upper()
         loop = asyncio.get_event_loop()
 
-        # ── Crypto → Binance ────────────────────────────────────────────
-        if sym in _BINANCE_SYMBOLS:
-            b_sym      = _BINANCE_SYMBOLS[sym]
-            b_interval = _BINANCE_INTERVALS.get(timeframe, "1h")
+        # ── Crypto → OKX ────────────────────────────────────────────────
+        if sym in _OKX_SYMBOLS:
+            inst_id  = _OKX_SYMBOLS[sym]
+            bar      = _OKX_INTERVALS.get(timeframe, "1H")
             try:
                 candles = await loop.run_in_executor(
                     None,
-                    lambda: _fetch_binance_sync(b_sym, b_interval, limit),
+                    lambda: _fetch_okx_sync(inst_id, bar, limit),
                 )
-                logger.debug(f"[Binance] {sym} [{timeframe}] → {len(candles)} candles")
+                logger.debug(f"[OKX] {sym} [{timeframe}] → {len(candles)} candles")
                 return candles
             except Exception as e:
-                logger.error(f"[Binance] {sym} [{timeframe}] failed: {e}")
+                logger.error(f"[OKX] {sym} [{timeframe}] failed: {e}")
                 return []
 
         # ── Forex / Gold / Commodities → Yahoo Finance v8 ───────────────
@@ -350,7 +362,7 @@ class MultiProvider(DataProvider):
                 logger.debug(f"[Yahoo] {sym} [{timeframe}] → {len(candles)} candles")
                 return candles
             except Exception as e:
-                logger.error(f"[Yahoo] {sym} ({ticker}) [{timeframe}] failed: {e}")
+                logger.error(f"[Yahoo] {sym} [{timeframe}] failed: {e}")
                 return []
 
         logger.warning(f"[MultiProvider] Unknown symbol: {sym}")
