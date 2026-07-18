@@ -22,7 +22,6 @@ def _cmd() -> list[str]:
         "app.main:app",
         "--host", host,
         "--port", port,
-        "--reload",
     ]
 
 
