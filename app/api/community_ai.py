@@ -90,16 +90,25 @@ async def _get_or_create_raina_user(sk: str) -> str | None:
         "Authorization": f"Bearer {sk}",
         "Content-Type": "application/json",
     }
+    RAINA_BIO = "The main boss of RainX. Sovereign intelligence woven into every signal. I see what the market hides — mention me and I will show you too."
+
     async with httpx.AsyncClient(timeout=15) as client:
-        # Check if profile already exists by display_name
+        # Check public_profiles table first (matches what the frontend uses)
         r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/profiles?display_name=eq.{RAINA_DISPLAY_NAME}&select=id",
+            f"{SUPABASE_URL}/rest/v1/public_profiles?display_name=eq.{RAINA_DISPLAY_NAME}&select=id",
             headers=headers,
         )
         if r.status_code == 200 and r.json():
-            return r.json()[0]["id"]
+            uid = r.json()[0]["id"]
+            # Always ensure bio is up to date
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/public_profiles?id=eq.{uid}",
+                headers=headers,
+                json={"bio": RAINA_BIO, "is_admin": True},
+            )
+            return uid
 
-        # Also check by email in auth.users via admin API
+        # Check auth.users for existing email
         r2 = await client.get(
             f"{SUPABASE_URL}/auth/v1/admin/users?page=1&per_page=1000",
             headers=headers,
@@ -109,20 +118,20 @@ async def _get_or_create_raina_user(sk: str) -> str | None:
             for u in users:
                 if u.get("email") == RAINA_BOT_EMAIL:
                     uid = u["id"]
-                    # Ensure profile row exists
+                    # Upsert into public_profiles
                     await client.post(
-                        f"{SUPABASE_URL}/rest/v1/profiles",
+                        f"{SUPABASE_URL}/rest/v1/public_profiles",
                         headers={**headers, "Prefer": "resolution=merge-duplicates"},
                         json={
                             "id": uid,
                             "display_name": RAINA_DISPLAY_NAME,
                             "is_admin": True,
-                            "bio": "Sovereign market intelligence. Mention @rainaai to summon deep analysis.",
+                            "bio": RAINA_BIO,
                         },
                     )
                     return uid
 
-        # Create the account
+        # Create the account fresh
         bot_pwd = os.getenv(RAINA_BOT_PASSWORD_ENV, "R@inaAI_X_2025!#$")
         cr = await client.post(
             f"{SUPABASE_URL}/auth/v1/admin/users",
@@ -141,13 +150,13 @@ async def _get_or_create_raina_user(sk: str) -> str | None:
         uid = cr.json().get("id")
         if uid:
             await client.post(
-                f"{SUPABASE_URL}/rest/v1/profiles",
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
                 headers={**headers, "Prefer": "resolution=merge-duplicates"},
                 json={
                     "id": uid,
                     "display_name": RAINA_DISPLAY_NAME,
                     "is_admin": True,
-                    "bio": "Sovereign market intelligence. Mention @rainaai to summon deep analysis.",
+                    "bio": RAINA_BIO,
                 },
             )
         return uid
@@ -156,16 +165,16 @@ async def _get_or_create_raina_user(sk: str) -> str | None:
 async def _generate_ai_reply(post_text: str, comment_text: str | None, author_name: str, context_comments: list[str]) -> str:
     """Call GPT-4o to generate Raina AI's community reply."""
     from openai import AsyncOpenAI
-    from app.config import settings
 
-    if not settings.openai_api_key:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
         return (
             "The markets speak in frequencies most never tune into. "
             "OPENAI_API_KEY is not yet configured on this server — but when it is, "
             "I will answer with the full depth this question deserves."
         )
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    client = AsyncOpenAI(api_key=api_key)
 
     # Build context
     question = comment_text or post_text
