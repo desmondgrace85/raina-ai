@@ -49,7 +49,7 @@ async def _rainx_signup(name: str, email: str, password: str, telegram_id: int) 
         return {"ok": False, "reason": "rainx_not_configured"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{base}/auth/register", json={
+            r = await client.post(f"{base}/api/auth/register", json={
                 "name": name, "email": email, "password": password,
                 "telegram_id": telegram_id,
             })
@@ -66,7 +66,7 @@ async def _rainx_login(email: str, password: str, telegram_id: int) -> dict[str,
         return {"ok": False, "reason": "rainx_not_configured"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{base}/auth/login", json={
+            r = await client.post(f"{base}/api/auth/login", json={
                 "email": email, "password": password,
                 "telegram_id": telegram_id,
             })
