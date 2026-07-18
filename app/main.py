@@ -119,6 +119,9 @@ app.include_router(router)
 app.include_router(chat_router)
 app.include_router(mt5_router)
 
+from app.api.community_ai import router as community_ai_router
+app.include_router(community_ai_router)
+
 
 @app.get("/")
 async def root():

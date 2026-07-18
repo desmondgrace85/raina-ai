@@ -300,13 +300,6 @@ async def signup_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             "Once active, signals will start arriving here automatically.",
         )
     else:
-        # This branch is no longer reached (signup goes direct to Supabase)
-        # but kept as a safety fallback
-        await update.effective_chat.send_message(
-            "✅ Account registered! Your details have been saved.\n"
-            "Visit RainX to complete setup and activate your subscription.",
-        )
-    else:
         err = result.get("error", "")
         if err == "already_exists":
             msg = "An account with that email already exists.\n\nUse /start and choose 'Log in' instead."
