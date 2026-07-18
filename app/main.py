@@ -13,6 +13,7 @@ import logging
 from fastapi import FastAPI
 
 from app.api.routes import router, set_provider
+from app.api.chat import router as chat_router, set_provider as chat_set_provider
 from app.api.mt5_routes import router as mt5_router
 from app.config import settings
 from app.data_providers.base import DataProvider
@@ -62,6 +63,7 @@ async def startup():
 
     provider = _build_provider()
     set_provider(provider)
+    chat_set_provider(provider)
     logger.info(f"Data provider: {settings.data_provider}")
 
     # Start background scanner
@@ -110,6 +112,7 @@ async def shutdown():
 
 
 app.include_router(router)
+app.include_router(chat_router)
 app.include_router(mt5_router)
 
 
