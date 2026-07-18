@@ -37,52 +37,149 @@ LOGIN_EMAIL = 4
 LOGIN_PASSWORD = 5
 
 
-# ── RainX API helpers ──────────────────────────────────────────────────────────
+# ── Supabase direct helpers ────────────────────────────────────────────────────
+# The bot talks to Supabase directly instead of going through the Vercel
+# frontend. When SUPABASE_SERVICE_KEY is set it uses the Admin API
+# (no confirmation email, no rate limit). Otherwise it falls back to the
+# anon signup endpoint (subject to Supabase's 3/hr SMTP rate limit on free plans).
 
-def _rainx_url() -> str:
-    return os.getenv("RAINX_API_URL", "").rstrip("/")
+_SUPABASE_URL = "https://fsndqkacfizulovhfldz.supabase.co"
+_SUPABASE_ANON_KEY = "sb_publishable_iRh4f9MF6ZDg43cSrA7zNQ_uIpi1eg9"
+
+
+def _service_key() -> str:
+    return os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 
 async def _rainx_signup(name: str, email: str, password: str, telegram_id: int) -> dict[str, Any]:
-    base = _rainx_url()
-    if not base:
-        return {"ok": False, "reason": "rainx_not_configured"}
+    sk = _service_key()
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{base}/api/auth/register", json={
-                "name": name, "email": email, "password": password,
-                "telegram_id": telegram_id,
-            })
-        data = r.json()
-        return {"ok": r.status_code in (200, 201), "data": data}
+        if sk:
+            # ── Admin path: pre-confirmed, no email sent, no rate limit ──────
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{_SUPABASE_URL}/auth/v1/admin/users",
+                    headers={
+                        "apikey": sk,
+                        "Authorization": f"Bearer {sk}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "email": email,
+                        "password": password,
+                        "email_confirm": True,
+                        "user_metadata": {"name": name, "telegram_id": telegram_id},
+                    },
+                )
+            body = r.json()
+            if r.status_code in (200, 201):
+                user_id = body.get("id")
+                if user_id:
+                    # Upsert profile row so the web app sees the telegram_id
+                    async with httpx.AsyncClient(timeout=10) as pc:
+                        await pc.post(
+                            f"{_SUPABASE_URL}/rest/v1/profiles",
+                            headers={
+                                "apikey": sk,
+                                "Authorization": f"Bearer {sk}",
+                                "Content-Type": "application/json",
+                                "Prefer": "resolution=merge-duplicates",
+                            },
+                            json={
+                                "id": user_id, "name": name,
+                                "telegram_id": telegram_id,
+                                "subscription": "none", "is_active": False,
+                            },
+                        )
+                return {"ok": True, "subscription": "none", "is_active": False, "name": name}
+            err_msg = (body.get("msg") or body.get("message") or
+                       body.get("error_description") or str(body))
+            if "already registered" in err_msg.lower() or r.status_code == 422:
+                return {"ok": False, "error": "already_exists"}
+            return {"ok": False, "error": err_msg}
+
+        else:
+            # ── Anon path: regular signup (may hit SMTP rate limit) ──────────
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(
+                    f"{_SUPABASE_URL}/auth/v1/signup",
+                    headers={
+                        "apikey": _SUPABASE_ANON_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "email": email,
+                        "password": password,
+                        "data": {"name": name, "telegram_id": telegram_id},
+                    },
+                )
+            body = r.json()
+            if r.status_code in (200, 201) and body.get("id"):
+                return {"ok": True, "subscription": "none", "is_active": False, "name": name}
+            err_msg = body.get("msg") or body.get("message") or body.get("error") or "Signup failed"
+            return {"ok": False, "error": err_msg}
+
     except Exception as e:
-        logger.error(f"RainX signup error: {e}")
-        return {"ok": False, "reason": str(e)}
+        logger.error(f"Supabase signup error: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 async def _rainx_login(email: str, password: str, telegram_id: int) -> dict[str, Any]:
-    base = _rainx_url()
-    if not base:
-        return {"ok": False, "reason": "rainx_not_configured"}
+    sk = _service_key()
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{base}/api/auth/login", json={
-                "email": email, "password": password,
-                "telegram_id": telegram_id,
-            })
-        if r.status_code == 200:
-            data = r.json()
-            return {
-                "ok": True,
-                "token": data.get("token", ""),
-                "subscription": data.get("subscription", "none"),
-                "is_active": data.get("is_active", False),
-                "name": data.get("name", ""),
-            }
-        return {"ok": False, "reason": "invalid_credentials"}
+        # Sign in with password via Supabase token endpoint (works with anon key)
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{_SUPABASE_URL}/auth/v1/token?grant_type=password",
+                headers={
+                    "apikey": _SUPABASE_ANON_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"email": email, "password": password},
+            )
+        if r.status_code != 200:
+            body = r.json()
+            err = body.get("error_description") or body.get("msg") or "Invalid email or password"
+            return {"ok": False, "error": err}
+
+        session = r.json()
+        access_token = session.get("access_token", "")
+        user_id = session.get("user", {}).get("id")
+
+        # Fetch profile for subscription info
+        profile = {}
+        hdr = {"apikey": sk or _SUPABASE_ANON_KEY,
+               "Authorization": f"Bearer {access_token}",
+               "Content-Type": "application/json"}
+        if user_id:
+            async with httpx.AsyncClient(timeout=10) as client:
+                pr = await client.get(
+                    f"{_SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=*",
+                    headers=hdr,
+                )
+            if pr.status_code == 200 and pr.json():
+                profile = pr.json()[0]
+                # Update telegram_id in profile
+                if sk:
+                    async with httpx.AsyncClient(timeout=10) as pc:
+                        await pc.patch(
+                            f"{_SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
+                            headers={**hdr, "Authorization": f"Bearer {sk}",
+                                     "Prefer": "return=minimal"},
+                            json={"telegram_id": telegram_id},
+                        )
+
+        return {
+            "ok": True,
+            "token": access_token,
+            "subscription": profile.get("subscription", "none"),
+            "is_active": bool(profile.get("is_active", False)),
+            "name": profile.get("name") or profile.get("username") or "",
+        }
+
     except Exception as e:
-        logger.error(f"RainX login error: {e}")
-        return {"ok": False, "reason": str(e)}
+        logger.error(f"Supabase login error: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -202,16 +299,21 @@ async def signup_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             "To receive signals, activate a subscription on the RainX website.\n"
             "Once active, signals will start arriving here automatically.",
         )
-    elif result.get("reason") == "rainx_not_configured":
-        # Store locally — RainX will sync later via webhook
-        await upsert_user(telegram_id=tid, telegram_name=name, email=email)
+    else:
+        # This branch is no longer reached (signup goes direct to Supabase)
+        # but kept as a safety fallback
         await update.effective_chat.send_message(
             "✅ Account registered! Your details have been saved.\n"
             "Visit RainX to complete setup and activate your subscription.",
         )
     else:
-        data = result.get("data", {})
-        msg = data.get("message") or data.get("detail") or "Registration failed. Please try again."
+        err = result.get("error", "")
+        if err == "already_exists":
+            msg = "An account with that email already exists.\n\nUse /start and choose 'Log in' instead."
+        elif "rate limit" in err.lower():
+            msg = "⏳ Too many signup attempts right now. Please try again in a few minutes, or sign up at https://rainx-webapp.vercel.app and then log in here."
+        else:
+            msg = err or "Registration failed. Please try again."
         await update.effective_chat.send_message(f"❌ {msg}")
         return ConversationHandler.END
 
