@@ -23,8 +23,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
 
     # ── Signal quality gate ────────────────────────────────────────────────
-    min_signal_confidence: float = 65.0
-    scalp_min_confidence: float = 60.0
+    # 60% threshold — bot sends signals it has genuine conviction about.
+    # Strong setups with multi-factor agreement will still reach 70-85%.
+    min_signal_confidence: float = 60.0
+    scalp_min_confidence: float = 55.0
     scalp_timeframes: list[str] = ["1m", "5m", "15m"]
 
     # ── Background scanner intervals (minutes) ────────────────────────────
@@ -34,7 +36,7 @@ class Settings(BaseSettings):
 
     # ── Telegram ──────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
-    telegram_chat_id: str = ""   # fallback admin chat only
+    telegram_chat_id: str = ""
 
     # ── RainX web app integration ─────────────────────────────────────────
     rainx_api_url: str = ""
@@ -42,9 +44,9 @@ class Settings(BaseSettings):
     # ── Default watchlist ─────────────────────────────────────────────────
     default_watchlist: list[str] = [
         "EURUSD", "GBPUSD", "USDJPY",   # forex
-        "BTCUSD", "ETHUSD",              # crypto
-        "XAUUSD",                        # gold
-        "WTICOUSD",                      # oil
+        "BTCUSD", "ETHUSD",             # crypto
+        "XAUUSD",                       # gold
+        "WTICOUSD",                     # oil
     ]
 
     class Config:
