@@ -209,18 +209,25 @@ async def live_price(symbol: str = Query(...)):
 
 
 @router.get("/candles")
-async def candle_series(symbol: str = Query(...), interval: str = Query(default="1h")):
+async def candle_series(
+    symbol: str = Query(...),
+    interval: str = Query(default="1h"),
+    limit: int = Query(default=60, ge=10, le=300),
+):
     """
     OHLCV series via yfinance.
     Response shape matches the old Twelve Data shape so the chart works unchanged:
     { values: [{ datetime, open, high, low, close }] }  newest-first
+
+    `limit` controls how many candles to return (10-300, default 60).
+    The full-screen chart requests up to 300 for deep history panning.
     """
     provider = get_provider()
     # Normalise interval labels from either Twelve Data or RainX keys
     tf_alias = {"60min": "1h", "240min": "4h", "1day": "1d", "daily": "1d"}
     tf = tf_alias.get(interval, interval)
     try:
-        candles = await provider.get_candles(symbol.upper(), tf, limit=60)
+        candles = await provider.get_candles(symbol.upper(), tf, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     values = [
