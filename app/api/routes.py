@@ -261,6 +261,17 @@ _vapid_keys: dict | None = None
 
 
 def _get_vapid_keys() -> dict:
+    """
+    Return VAPID key pair.
+
+    Expected env vars (set these on Railway to persist across restarts):
+      VAPID_PUBLIC_KEY  — base64url-encoded uncompressed EC P-256 point (65 raw bytes → ~87 chars)
+      VAPID_PRIVATE_KEY — base64url-encoded raw EC P-256 scalar (32 bytes → ~43 chars)
+
+    If not set, keys are auto-generated on first call but lost on restart.
+    The public key MUST be base64url (not hex) — that is what browsers expect
+    when calling PushManager.subscribe({ applicationServerKey }).
+    """
     global _vapid_keys
     if _vapid_keys:
         return _vapid_keys
@@ -271,20 +282,23 @@ def _get_vapid_keys() -> dict:
         return _vapid_keys
     # Auto-generate (keys will be lost on restart unless env vars are set)
     try:
-        from py_vapid import Vapid
-        vapid = Vapid()
-        vapid.generate_keys()
-        _vapid_keys = {
-            "private": vapid.private_key.private_bytes(
-                encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding", "PrivateFormat", "NoEncryption"]).Encoding.PEM,
-                format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["PrivateFormat"]).PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization", fromlist=["NoEncryption"]).NoEncryption(),
-            ).decode(),
-            "public": vapid.public_key.public_bytes(
-                encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding"]).Encoding.X962,
-                format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["PublicFormat"]).PublicFormat.UncompressedPoint,
-            ).hex(),
-        }
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat, PrivateFormat, NoEncryption,
+        )
+        priv = generate_private_key(SECP256R1())
+        pub  = priv.public_key()
+        # Public key: uncompressed point (65 bytes) encoded as base64url — what browsers need
+        raw_pub = pub.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        pub_b64url = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
+        # Private key: raw scalar (32 bytes) encoded as base64url — accepted by pywebpush
+        priv_jwk = priv.private_numbers()
+        raw_priv = priv_jwk.private_value.to_bytes(32, "big")
+        priv_b64url = base64.urlsafe_b64encode(raw_priv).rstrip(b"=").decode()
+        _vapid_keys = {"private": priv_b64url, "public": pub_b64url}
+        logger.info("VAPID keys auto-generated. Set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY env vars on Railway to persist them.")
+        logger.info(f"VAPID_PUBLIC_KEY={pub_b64url}")
     except Exception as e:
         logger.warning(f"VAPID key generation failed: {e}")
         _vapid_keys = {"private": "", "public": ""}
