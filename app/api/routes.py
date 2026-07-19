@@ -5,13 +5,21 @@ Thin layer — all logic lives in engines/analysis/scanner. Routes just
 wire HTTP requests to those functions using the shared data provider
 instance (injected from app.main).
 """
+import json
+import logging
+import os
+
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from app.config import settings
 from app.data_providers.base import DataProvider
 from app.engines import long_term_engine, scalping_engine
 from app.models.signal import Signal
 from app.scanner import multi_market_scanner
+from app.storage.database import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -241,3 +249,161 @@ async def candle_series(
         for c in reversed(candles)  # newest first
     ]
     return {"values": values, "symbol": symbol.upper(), "interval": interval}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web Push Notification Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+# VAPID keys — generated once and stored in env or auto-generated on first run.
+# Set VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY env vars on Railway to persist them.
+_vapid_keys: dict | None = None
+
+
+def _get_vapid_keys() -> dict:
+    global _vapid_keys
+    if _vapid_keys:
+        return _vapid_keys
+    private_key = os.getenv("VAPID_PRIVATE_KEY", "")
+    public_key = os.getenv("VAPID_PUBLIC_KEY", "")
+    if private_key and public_key:
+        _vapid_keys = {"private": private_key, "public": public_key}
+        return _vapid_keys
+    # Auto-generate (keys will be lost on restart unless env vars are set)
+    try:
+        from py_vapid import Vapid
+        vapid = Vapid()
+        vapid.generate_keys()
+        _vapid_keys = {
+            "private": vapid.private_key.private_bytes(
+                encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding", "PrivateFormat", "NoEncryption"]).Encoding.PEM,
+                format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["PrivateFormat"]).PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization", fromlist=["NoEncryption"]).NoEncryption(),
+            ).decode(),
+            "public": vapid.public_key.public_bytes(
+                encoding=__import__("cryptography.hazmat.primitives.serialization", fromlist=["Encoding"]).Encoding.X962,
+                format=__import__("cryptography.hazmat.primitives.serialization", fromlist=["PublicFormat"]).PublicFormat.UncompressedPoint,
+            ).hex(),
+        }
+    except Exception as e:
+        logger.warning(f"VAPID key generation failed: {e}")
+        _vapid_keys = {"private": "", "public": ""}
+    return _vapid_keys
+
+
+class PushSubscriptionBody(BaseModel):
+    subscription: dict  # {endpoint, keys: {p256dh, auth}}
+    userId: str
+    activeMarkets: list[str] = []
+
+
+@router.get("/push/keys")
+async def push_keys():
+    """Return the VAPID public key for the frontend to use when subscribing."""
+    keys = _get_vapid_keys()
+    return {"publicKey": keys.get("public", "")}
+
+
+@router.post("/push/subscribe")
+async def push_subscribe(body: PushSubscriptionBody):
+    """Store or update a push subscription for a user."""
+    sub = body.subscription
+    endpoint = sub.get("endpoint", "")
+    keys = sub.get("keys", {})
+    p256dh = keys.get("p256dh", "")
+    auth = keys.get("auth", "")
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="Invalid subscription object")
+
+    db = get_db()
+    active_markets_json = json.dumps(body.activeMarkets)
+    now = __import__("datetime").datetime.utcnow().isoformat()
+    await db.execute(
+        """
+        INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, active_markets, created_at, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(endpoint) DO UPDATE SET
+            user_id = excluded.user_id,
+            p256dh = excluded.p256dh,
+            auth = excluded.auth,
+            active_markets = excluded.active_markets,
+            last_seen = excluded.last_seen
+        """,
+        (body.userId, endpoint, p256dh, auth, active_markets_json, now, now),
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/push/send")
+async def push_send(payload: dict):
+    """
+    Internal endpoint: send a push notification to a specific user or all subscribers.
+    Body: { userId?: str, symbol?: str, title: str, body: str, category?: str }
+    If symbol is provided, only send to subscribers who have that symbol in active_markets.
+    """
+    title = payload.get("title", "RainX")
+    body_text = payload.get("body", "")
+    symbol = payload.get("symbol")
+    target_user = payload.get("userId")
+    category = payload.get("category", "trading")
+
+    db = get_db()
+    if target_user:
+        cursor = await db.execute("SELECT * FROM push_subscriptions WHERE user_id = ?", (target_user,))
+    else:
+        cursor = await db.execute("SELECT * FROM push_subscriptions")
+    rows = await cursor.fetchall()
+
+    sent = 0
+    failed = 0
+    keys = _get_vapid_keys()
+    if not keys.get("private"):
+        return {"ok": False, "error": "VAPID keys not configured"}
+
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return {"ok": False, "error": "pywebpush not installed"}
+
+    notification_payload = json.dumps({
+        "title": title,
+        "body": body_text,
+        "category": category,
+        "tag": f"rainx-{category}-{symbol or 'all'}",
+    })
+
+    for row in rows:
+        # Filter by symbol if provided
+        if symbol:
+            try:
+                active = json.loads(row["active_markets"] or "[]")
+                if symbol not in active:
+                    continue
+            except Exception:
+                continue
+
+        subscription_info = {
+            "endpoint": row["endpoint"],
+            "keys": {"p256dh": row["p256dh"], "auth": row["auth"]},
+        }
+        try:
+            webpush(
+                subscription_info=subscription_info,
+                data=notification_payload,
+                vapid_private_key=keys["private"],
+                vapid_claims={"sub": "mailto:admin@rainx.app"},
+            )
+            sent += 1
+        except WebPushException as ex:
+            logger.warning(f"Push failed for {row['endpoint'][:40]}: {ex}")
+            if ex.response and ex.response.status_code in (404, 410):
+                # Subscription expired — remove it
+                await db.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (row["endpoint"],))
+            failed += 1
+        except Exception as ex:
+            logger.warning(f"Push error: {ex}")
+            failed += 1
+
+    await db.commit()
+    return {"ok": True, "sent": sent, "failed": failed}

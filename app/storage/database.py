@@ -102,6 +102,29 @@ CREATE TABLE IF NOT EXISTS mt5_trades (
 );
 """
 
+_CREATE_PUSH_SUBSCRIPTIONS = """
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT    NOT NULL,
+    endpoint        TEXT    NOT NULL UNIQUE,
+    p256dh          TEXT    NOT NULL,
+    auth            TEXT    NOT NULL,
+    active_markets  TEXT    NOT NULL DEFAULT '[]',
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    last_seen       TEXT
+);
+"""
+
+_CREATE_USER_ACTIVE_MARKETS = """
+CREATE TABLE IF NOT EXISTS user_active_markets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     TEXT    NOT NULL,
+    symbol      TEXT    NOT NULL,
+    added_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, symbol)
+);
+"""
+
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_signals_asset  ON signals(asset);",
     "CREATE INDEX IF NOT EXISTS idx_signals_engine ON signals(engine);",
@@ -110,6 +133,8 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_users_sub      ON telegram_users(subscription, is_active);",
     "CREATE INDEX IF NOT EXISTS idx_mt5_trades_tid ON mt5_trades(telegram_id, status);",
     "CREATE INDEX IF NOT EXISTS idx_mt5_trades_key ON mt5_trades(api_key, status);",
+    "CREATE INDEX IF NOT EXISTS idx_push_uid       ON push_subscriptions(user_id);",
+    "CREATE INDEX IF NOT EXISTS idx_uam_uid        ON user_active_markets(user_id);",
 ]
 
 _db: aiosqlite.Connection | None = None
@@ -126,6 +151,8 @@ async def init_db() -> None:
     await _db.execute(_CREATE_MT5_ACCOUNTS)
     await _db.execute(_CREATE_MT5_SETTINGS)
     await _db.execute(_CREATE_MT5_TRADES)
+    await _db.execute(_CREATE_PUSH_SUBSCRIPTIONS)
+    await _db.execute(_CREATE_USER_ACTIVE_MARKETS)
     for idx in _INDEXES:
         await _db.execute(idx)
     await _db.commit()
