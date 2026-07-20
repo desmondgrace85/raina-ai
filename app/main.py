@@ -102,9 +102,16 @@ async def startup():
         await start_bot(provider)
     asyncio.create_task(_start_bot_bg())
 
+    # Start News Flow community news bot
+    from app.news_bot.news_flow import start_news_flow
+    start_news_flow()
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    from app.news_bot.news_flow import stop_news_flow
+    stop_news_flow()
+
     from app.scanner.background_scanner import stop_background_scanner
     stop_background_scanner()
 
