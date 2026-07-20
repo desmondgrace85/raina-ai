@@ -49,6 +49,10 @@ class Settings(BaseSettings):
         "WTICOUSD",                     # oil
     ]
 
+    supabase_url: str = "https://fsndqkacfizulovhfldz.supabase.co"
+    supabase_anon_key: str = "sb_publishable_iRh4f9MF6ZDg43cSrA7zNQ_uIpi1eg9"
+    supabase_service_key: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"
