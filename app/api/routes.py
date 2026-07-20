@@ -421,3 +421,47 @@ async def push_send(payload: dict):
 
     await db.commit()
     return {"ok": True, "sent": sent, "failed": failed}
+
+
+@router.get("/signals/track/{symbol}")
+async def track_signal(
+    symbol: str,
+    entry: float = Query(...),
+    direction: str = Query(...),
+    stop_loss: float = Query(...),
+    take_profit_1: float = Query(...),
+    take_profit_2: float = Query(default=0),
+):
+    """Track an active trade — returns current pip P&L and TP/SL hit status."""
+    provider = get_provider()
+    try:
+        bars = await provider.get_ohlcv(symbol.upper(), "1m", limit=1)
+        if not bars:
+            raise HTTPException(status_code=404, detail="Price not available")
+        current = float(bars[-1]["close"])
+        sym = symbol.upper()
+        if "JPY" in sym: pip = 0.01
+        elif any(x in sym for x in ["BTC","ETH","BNB","SOL"]): pip = 1.0
+        elif "XAU" in sym: pip = 0.1
+        else: pip = 0.0001
+        if direction.upper() == "BUY":
+            pips = (current - entry) / pip
+            tp1_hit = current >= take_profit_1
+            tp2_hit = bool(take_profit_2) and current >= take_profit_2
+            sl_hit = current <= stop_loss
+        else:
+            pips = (entry - current) / pip
+            tp1_hit = current <= take_profit_1
+            tp2_hit = bool(take_profit_2) and current <= take_profit_2
+            sl_hit = current >= stop_loss
+        pips = round(pips, 1)
+        status = "active"
+        if sl_hit: status = "stopped_out"
+        elif tp2_hit: status = "tp2_hit"
+        elif tp1_hit: status = "tp1_hit"
+        sign = "+" if pips > 0 else ""
+        return {"symbol": sym, "direction": direction.upper(), "entry": entry, "current_price": current, "pips": pips, "pips_label": sign + str(int(pips)) + " pips", "status": status, "tp1_hit": tp1_hit, "tp2_hit": tp2_hit, "sl_hit": sl_hit}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
