@@ -11,6 +11,7 @@ reproducible while you're testing.
 import hashlib
 import math
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import numpy as np
 
@@ -37,7 +38,7 @@ class MockDataProvider(DataProvider):
     async def get_available_symbols(self) -> list[str]:
         return list(_BASE_PRICES.keys())
 
-    async def get_candles(self, symbol: str, timeframe: str, limit: int = 200) -> list[Candle]:
+    async def get_candles(self, symbol: str, timeframe: str, limit: int = 200, before: Optional[datetime] = None) -> list[Candle]:
         base_price = _BASE_PRICES.get(symbol, 100.0)
         minutes = _TIMEFRAME_MINUTES.get(timeframe, 60)
         rng = np.random.default_rng(_seed_for(symbol, timeframe))

@@ -8,6 +8,8 @@ instance (injected from app.main).
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -220,22 +222,26 @@ async def live_price(symbol: str = Query(...)):
 async def candle_series(
     symbol: str = Query(...),
     interval: str = Query(default="1h"),
-    limit: int = Query(default=60, ge=10, le=300),
+    limit: int = Query(default=60, ge=10, le=500),
+    before: Optional[int] = Query(default=None, description="Fetch candles ending before this Unix timestamp (seconds). Used for infinite-scroll history loading."),
 ):
     """
-    OHLCV series via yfinance.
-    Response shape matches the old Twelve Data shape so the chart works unchanged:
-    { values: [{ datetime, open, high, low, close }] }  newest-first
+    OHLCV series via yfinance / OKX.
+    Response shape: { values: [{ datetime, open, high, low, close }] }  newest-first
 
-    `limit` controls how many candles to return (10-300, default 60).
-    The full-screen chart requests up to 300 for deep history panning.
+    `limit` controls how many candles to return (10–500, default 60).
+    `before` (optional Unix epoch seconds) returns candles strictly older than that timestamp,
+    enabling the frontend to page backwards through history.
     """
     provider = get_provider()
     # Normalise interval labels from either Twelve Data or RainX keys
     tf_alias = {"60min": "1h", "240min": "4h", "1day": "1d", "daily": "1d"}
     tf = tf_alias.get(interval, interval)
+    before_dt: Optional[datetime] = (
+        datetime.fromtimestamp(before, tz=timezone.utc) if before else None
+    )
     try:
-        candles = await provider.get_candles(symbol.upper(), tf, limit=limit)
+        candles = await provider.get_candles(symbol.upper(), tf, limit=limit, before=before_dt)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     values = [

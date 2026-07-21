@@ -189,7 +189,7 @@ class YFinanceProvider(DataProvider):
         return list(_SYMBOL_MAP.keys())
 
     async def get_candles(
-        self, symbol: str, timeframe: str, limit: int = 200
+        self, symbol: str, timeframe: str, limit: int = 200, before=None
     ) -> list[Candle]:
         ticker = _SYMBOL_MAP.get(symbol.upper(), symbol)
         yf_interval = _YF_INTERVAL.get(timeframe, "1h")

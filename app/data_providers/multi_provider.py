@@ -158,16 +158,21 @@ def _get_yahoo_crumb() -> str:
 
 # ── OKX fetcher ──────────────────────────────────────────────────────────────
 
-def _fetch_okx_sync(inst_id: str, bar: str, limit: int) -> list[Candle]:
+def _fetch_okx_sync(inst_id: str, bar: str, limit: int, after_ms: Optional[int] = None) -> list[Candle]:
     """
     Fetch OHLCV candles from OKX public REST API (no auth, no geo-block).
     OKX returns data newest-first; we reverse to oldest-first before returning.
     Response columns: [ts_ms, open, high, low, close, vol_base, volCcy, volCcyQuote, confirm]
+
+    after_ms: if set, only return candles with timestamp < after_ms (older candles).
+              Maps to OKX's `after` pagination param (returns bars older than the ts).
     """
     url = "https://www.okx.com/api/v5/market/candles"
     # OKX max limit per request is 300
     fetch_limit = min(limit + 50, 300)
-    params = {"instId": inst_id, "bar": bar, "limit": fetch_limit}
+    params: dict = {"instId": inst_id, "bar": bar, "limit": fetch_limit}
+    if after_ms is not None:
+        params["after"] = str(after_ms)  # OKX: returns candles older than this ts_ms
 
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
@@ -241,15 +246,31 @@ def _parse_yahoo_chart(j: dict) -> pd.DataFrame:
     return df
 
 
-def _fetch_yahoo_sync(ticker: str, interval: str, range_: str) -> pd.DataFrame:
+def _fetch_yahoo_sync(ticker: str, interval: str, range_: str, period2: Optional[int] = None) -> pd.DataFrame:
     """
     Fetch OHLCV from Yahoo Finance v8 chart endpoint using a browser-like
     session + crumb token so Railway's shared IP is not blocked.
+
+    period2: if set, fetch data ending at this Unix timestamp (seconds),
+             using period1/period2 instead of range for backward paging.
     """
     s     = _get_yahoo_session()
     crumb = _get_yahoo_crumb()
 
-    params: dict = {"interval": interval, "range": range_}
+    if period2 is not None:
+        # Compute how many seconds of history to fetch based on interval
+        _range_seconds: dict[str, int] = {
+            "1m": 86400, "5m": 5 * 86400, "15m": 60 * 86400,
+            "1h": 730 * 86400, "4h": 730 * 86400, "1d": 5 * 365 * 86400,
+        }
+        window = _range_seconds.get(interval, 730 * 86400)
+        params: dict = {
+            "interval": interval,
+            "period1": period2 - window,
+            "period2": period2,
+        }
+    else:
+        params: dict = {"interval": interval, "range": range_}
     if crumb:
         params["crumb"] = crumb
 
@@ -323,7 +344,11 @@ class MultiProvider(DataProvider):
         return list(_OKX_SYMBOLS) + list(_YAHOO_SYMBOLS)
 
     async def get_candles(
-        self, symbol: str, timeframe: str, limit: int = 200
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 200,
+        before: Optional[datetime] = None,
     ) -> list[Candle]:
         sym  = symbol.upper()
         loop = asyncio.get_event_loop()
@@ -332,12 +357,14 @@ class MultiProvider(DataProvider):
         if sym in _OKX_SYMBOLS:
             inst_id  = _OKX_SYMBOLS[sym]
             bar      = _OKX_INTERVALS.get(timeframe, "1H")
+            # Convert `before` datetime → OKX `after` param (ms timestamp of oldest known bar)
+            after_ms = int(before.timestamp() * 1000) if before else None
             try:
                 candles = await loop.run_in_executor(
                     None,
-                    lambda: _fetch_okx_sync(inst_id, bar, limit),
+                    lambda: _fetch_okx_sync(inst_id, bar, limit, after_ms=after_ms),
                 )
-                logger.debug(f"[OKX] {sym} [{timeframe}] → {len(candles)} candles")
+                logger.debug(f"[OKX] {sym} [{timeframe}] → {len(candles)} candles (before={before})")
                 return candles
             except Exception as e:
                 logger.error(f"[OKX] {sym} [{timeframe}] failed: {e}")
@@ -348,18 +375,23 @@ class MultiProvider(DataProvider):
             ticker   = _YAHOO_SYMBOLS[sym]
             interval = _YAHOO_INTERVALS.get(timeframe, "1h")
             range_   = _YAHOO_RANGES.get(timeframe, "60d")
+            # When paging backwards, use period1/period2 instead of range
+            period2  = int(before.timestamp()) if before else None
             try:
                 df = await loop.run_in_executor(
                     None,
-                    lambda: _fetch_yahoo_sync(ticker, interval, range_),
+                    lambda: _fetch_yahoo_sync(ticker, interval, range_, period2=period2),
                 )
                 if df is None or df.empty:
                     logger.warning(f"[Yahoo] {sym} ({ticker}) [{timeframe}] → empty")
                     return []
                 if timeframe == "4h":
                     df = _resample_to_4h(df)
+                # When paging, filter out bars >= before to avoid overlap
+                if before:
+                    df = df[df.index < before]
                 candles = _df_to_candles(df, limit)
-                logger.debug(f"[Yahoo] {sym} [{timeframe}] → {len(candles)} candles")
+                logger.debug(f"[Yahoo] {sym} [{timeframe}] → {len(candles)} candles (before={before})")
                 return candles
             except Exception as e:
                 logger.error(f"[Yahoo] {sym} [{timeframe}] failed: {e}")
