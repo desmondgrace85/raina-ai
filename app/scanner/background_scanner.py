@@ -33,9 +33,17 @@ _scheduler: AsyncIOScheduler | None = None
 async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
     """Run a full watchlist scan for the given timeframe and push qualifying signals."""
     from app.scanner import multi_market_scanner
-    from app.storage.signal_repo import save_signal, mark_sent_telegram
-    from app.telegram.bot import push_signal_to_subscribers
+    from app.storage.signal_repo import save_signal
+    from app.storage.supabase_push import push_signal_to_supabase, get_symbol_to_users
 
+      # Build {symbol: [user_ids]} from user-selected markets
+      symbol_to_users = {}
+      try:
+          symbol_to_users = await get_symbol_to_users()
+      except Exception as _e:
+          logger.warning(f"Could not load user markets: {_e}")
+      watchlist = list(symbol_to_users.keys()) if symbol_to_users else settings.default_watchlist
+    
     try:
         signals: list[Signal] = await multi_market_scanner.scan(
             provider,
@@ -72,9 +80,8 @@ async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
             f"confidence={sig.confidence:.1f}%"
         )
         try:
-            sent = await push_signal_to_subscribers(sig)
-            if sent > 0 and row_id > 0:
-                await mark_sent_telegram(row_id)
+            target_users = symbol_to_users.get(sig.asset.upper(), []) if 'symbol_to_users' in dir() else []
+            sent = await push_signal_to_supabase(sig, target_users, timeframe)
             pushed += sent
         except Exception as e:
             logger.warning(f"Push failed: {e}")
@@ -127,11 +134,7 @@ async def _news_watcher() -> None:
     lines.append("\n🔍 Running market scan for entry opportunities...")
     msg = "\n".join(lines)
 
-    try:
-        await push_text_to_subscribers(msg)
-        logger.info(f"[news_watcher] Pushed {len(events)} event(s) to subscribers")
-    except Exception as e:
-        logger.warning(f"[news_watcher] push failed: {e}")
+        logger.info(f"[news_watcher] {len(events)} event(s) — news_flow.py handles community posts")
 
 
 async def _scalp_and_trade(provider: DataProvider) -> None:
@@ -141,8 +144,8 @@ async def _scalp_and_trade(provider: DataProvider) -> None:
       2. Queued as MT5 trade orders for connected premium users
     """
     from app.scanner import multi_market_scanner
-    from app.storage.signal_repo import save_signal, mark_sent_telegram
-    from app.telegram.bot import push_signal_to_subscribers
+    from app.storage.signal_repo import save_signal
+    from app.storage.supabase_push import push_signal_to_supabase, get_symbol_to_users
     from app.mt5.trade_manager import queue_signal_for_all
 
     try:
@@ -170,9 +173,9 @@ async def _scalp_and_trade(provider: DataProvider) -> None:
 
         # Push Telegram notification
         try:
-            sent = await push_signal_to_subscribers(sig)
-            if sent > 0 and row_id > 0:
-                await mark_sent_telegram(row_id)
+            target_users = symbol_to_users.get(sig.asset.upper(), []) if 'symbol_to_users' in dir() else []
+            sent = await push_signal_to_supabase(sig, target_users, timeframe)
+            pushed += sent
         except Exception as e:
             logger.warning(f"Scalp push failed: {e}")
 
