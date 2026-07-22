@@ -114,3 +114,21 @@ async def get_all_users_count() -> dict[str, int]:
             "SELECT COUNT(*) FROM telegram_users WHERE subscription='premium' AND is_active=1"
         ),
     }
+
+
+    async def get_all_active_market_selections() -> dict:
+      """Return {user_id: [symbol, ...]} for all active market selections."""
+      from app.storage.database import get_db
+      try:
+          async with get_db() as db:
+              rows = await db.execute("SELECT user_id, symbol FROM user_active_markets")
+              result: dict = {}
+              for row in await rows.fetchall():
+                  uid, sym = str(row[0]), str(row[1]).upper()
+                  result.setdefault(uid, []).append(sym)
+              return result
+      except Exception as e:
+          import logging
+          logging.getLogger(__name__).warning(f"get_all_active_market_selections error: {e}")
+          return {}
+    
