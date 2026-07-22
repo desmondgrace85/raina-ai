@@ -92,7 +92,7 @@ async def _news_watcher() -> None:
     Telegram notification to all subscribers before the signal fires.
     """
     from app.scanner.news_scanner import get_todays_events
-    from app.telegram.bot import push_text_to_subscribers
+    # Telegram removed — news_flow.py handles community posts
 
     try:
         events = await get_todays_events()
