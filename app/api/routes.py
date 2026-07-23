@@ -313,7 +313,7 @@ def _get_vapid_keys() -> dict:
 
 class PushSubscriptionBody(BaseModel):
     subscription: dict  # {endpoint, keys: {p256dh, auth}}
-    userId: str
+    userId: str = ""
     activeMarkets: list[str] = []
 
 
