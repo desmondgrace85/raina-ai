@@ -34,7 +34,7 @@ async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
     """Run a full watchlist scan for the given timeframe and push qualifying signals."""
     from app.scanner import multi_market_scanner
     from app.storage.signal_repo import save_signal
-    from app.storage.supabase_push import push_signal_to_supabase, get_symbol_to_users
+    from app.storage.supabase_push import push_signal_to_supabase
 
       # Build {symbol: [user_ids]} from user-selected markets
       symbol_to_users = {}
@@ -95,11 +95,9 @@ async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
 async def _news_watcher() -> None:
     """
     Runs every 30 min. Fetches high-impact economic events for today.
-    If a new event is found that hasn't been announced yet, pushes a
-    Telegram notification to all subscribers before the signal fires.
+    Community news posts are handled by news_flow.py via Supabase.
     """
     from app.scanner.news_scanner import get_todays_events
-    # Telegram removed — news_flow.py handles community posts
 
     try:
         events = await get_todays_events()
@@ -110,37 +108,13 @@ async def _news_watcher() -> None:
     if not events:
         return
 
-    # Build a summary of upcoming/released events
-    lines = ["📰 *Market News Alert*\n"]
-    for ev in events:
-        actual   = ev.get("actual")
-        forecast = ev.get("forecast")
-        currency = ev.get("currency", "")
-        title    = ev.get("title", "")
-
-        if actual:
-            beat = ""
-            try:
-                a = float(str(actual).replace("%",""))
-                f = float(str(forecast).replace("%","")) if forecast else None
-                if f is not None:
-                    beat = " 🟢 Beat" if a > f else " 🔴 Miss"
-            except Exception:
-                pass
-            lines.append(f"📅 *{title}* ({currency}): `{actual}` (forecast: {forecast or '—'}){beat}")
-        else:
-            lines.append(f"⏰ *{title}* ({currency}) releasing soon — forecast: `{forecast or '—'}`")
-
-    lines.append("\n🔍 Running market scan for entry opportunities...")
-    msg = "\n".join(lines)
-
-        logger.info(f"[news_watcher] {len(events)} event(s) — news_flow.py handles community posts")
+    logger.info(f"[news_watcher] {len(events)} event(s) found — community posts handled by news_flow.py")
 
 
 async def _scalp_and_trade(provider: DataProvider) -> None:
     """
     5-minute scalp scan.  Qualifying signals are:
-      1. Pushed as Telegram notifications to subscribers (standard+)
+      1. Pushed as Supabase notifications to subscribers (standard+)
       2. Queued as MT5 trade orders for connected premium users
     """
     from app.scanner import multi_market_scanner
@@ -171,11 +145,11 @@ async def _scalp_and_trade(provider: DataProvider) -> None:
 
         logger.info(f"[5m scalp] SIGNAL {sig.direction.value} {sig.asset} {sig.confidence:.1f}%")
 
-        # Push Telegram notification
+        # Push signal notification via Supabase
         try:
-            target_users = symbol_to_users.get(sig.asset.upper(), []) if 'symbol_to_users' in dir() else []
-            sent = await push_signal_to_supabase(sig, target_users, timeframe)
-            pushed += sent
+            sent = await push_signal_to_supabase(sig, [], "5m")
+            if sent:
+                logger.info(f"[5m scalp] Delivered {sent} message(s)")
         except Exception as e:
             logger.warning(f"Scalp push failed: {e}")
 
