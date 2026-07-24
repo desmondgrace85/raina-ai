@@ -3,8 +3,8 @@ Raina AI — FastAPI application entry point.
 
 Startup sequence:
   1. Build the data provider (yfinance by default).
-  2. Start the background scanner (periodic scans → Telegram).
-  3. Start the Telegram bot (command + push mode).
+  2. Start the background scanner (periodic scans → Supabase push).
+  3. Start the Telegram bot if TELEGRAM_BOT_TOKEN is configured (optional).
 
 To swap in a different data source: add a branch in _build_provider().
 """
