@@ -13,6 +13,7 @@ Website sync endpoints:
   GET  /mt5/trades/{id}, /mt5/history/{id}, /mt5/performance/{id}
   POST /mt5/scalping/toggle
 """
+import asyncio
 import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -90,6 +91,12 @@ class MetaApiConnectPayload(BaseModel):
 
 @router.post('/connect/metaapi')
 async def connect_metaapi(payload: MetaApiConnectPayload):
+    """
+    Provision the MetaAPI cloud account and return immediately.
+    We do NOT wait for full synchronization here — a freshly provisioned
+    MetaAPI cloud terminal takes 60-120 s to connect to the broker.
+    The frontend should poll GET /mt5/account/{telegram_id} for live status.
+    """
     from app.mt5.metaapi_client import provision_account, get_account_info
     try:
         metaapi_id = await provision_account(
@@ -101,24 +108,43 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'MetaAPI provisioning failed: {str(e)}')
-    info = await get_account_info(metaapi_id)
-    broker_name = info.get('broker') or payload.mt5_server
-    account_number = payload.mt5_login
+
+    # Persist the account record immediately so the user sees "connected"
     api_key = await mt5_repo.upsert_mt5_account_full(
         telegram_id=payload.telegram_id,
         account_mode=payload.account_mode,
         metaapi_id=metaapi_id,
-        account_number=account_number,
-        broker_name=broker_name,
+        account_number=payload.mt5_login,
+        broker_name=payload.mt5_server,
     )
+
+    # Fire-and-forget: fetch live info once the terminal syncs (non-blocking)
+    async def _sync_later():
+        try:
+            await asyncio.sleep(90)   # give MetaAPI time to connect to broker
+            info = await get_account_info(metaapi_id)
+            if info.get("connected"):
+                await mt5_repo.upsert_mt5_account_full(
+                    telegram_id=payload.telegram_id,
+                    account_mode=payload.account_mode,
+                    metaapi_id=metaapi_id,
+                    account_number=payload.mt5_login,
+                    broker_name=info.get("broker") or payload.mt5_server,
+                )
+                logger.info(f"MetaAPI account {metaapi_id} sync confirmed for user {payload.telegram_id}")
+        except Exception as e:
+            logger.warning(f"Background MetaAPI sync failed for {metaapi_id}: {e}")
+
+    asyncio.create_task(_sync_later())
+
     return {
         'api_key': api_key,
         'metaapi_id': metaapi_id,
         'account_mode': payload.account_mode,
-        'broker_name': broker_name,
-        'account_number': account_number,
-        'balance': info.get('balance'),
-        'connected': info.get('connected', False),
+        'broker_name': payload.mt5_server,
+        'account_number': payload.mt5_login,
+        'balance': None,
+        'connected': True,   # provisioning succeeded; terminal syncs in background
     }
 
 
