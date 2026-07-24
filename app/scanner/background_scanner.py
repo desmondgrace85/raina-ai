@@ -119,7 +119,7 @@ async def _scalp_and_trade(provider: DataProvider) -> None:
     """
     from app.scanner import multi_market_scanner
     from app.storage.signal_repo import save_signal
-    from app.storage.supabase_push import push_signal_to_supabase, get_symbol_to_users
+    from app.storage.supabase_push import push_signal_to_supabase
     from app.mt5.trade_manager import queue_signal_for_all
 
     try:
