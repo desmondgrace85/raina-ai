@@ -78,7 +78,51 @@ async def connect(payload: ConnectPayload):
     api_key = await mt5_repo.upsert_mt5_account(payload.telegram_id, payload.account_mode)
     return {"api_key": api_key, "account_mode": payload.account_mode}
 
-@router.get("/account/{telegram_id}")
+# ── MetaAPI (cloud) connect ───────────────────────────────────────────────────
+
+class MetaApiConnectPayload(BaseModel):
+    telegram_id: int
+    mt5_login: str
+    mt5_password: str
+    mt5_server: str
+    account_mode: str = 'demo'
+    name: str = 'RainaAI User'
+
+@router.post('/connect/metaapi')
+async def connect_metaapi(payload: MetaApiConnectPayload):
+    from app.mt5.metaapi_client import provision_account, get_account_info
+    try:
+        metaapi_id = await provision_account(
+            mt5_login=payload.mt5_login,
+            mt5_password=payload.mt5_password,
+            mt5_server=payload.mt5_server,
+            account_mode=payload.account_mode,
+            name=payload.name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f'MetaAPI provisioning failed: {str(e)}')
+    info = await get_account_info(metaapi_id)
+    broker_name = info.get('broker') or payload.mt5_server
+    account_number = payload.mt5_login
+    api_key = await mt5_repo.upsert_mt5_account_full(
+        telegram_id=payload.telegram_id,
+        account_mode=payload.account_mode,
+        metaapi_id=metaapi_id,
+        account_number=account_number,
+        broker_name=broker_name,
+    )
+    return {
+        'api_key': api_key,
+        'metaapi_id': metaapi_id,
+        'account_mode': payload.account_mode,
+        'broker_name': broker_name,
+        'account_number': account_number,
+        'balance': info.get('balance'),
+        'connected': info.get('connected', False),
+    }
+
+
+@router.get('/account/{telegram_id}')
 async def get_account(telegram_id: int):
     account = await mt5_repo.get_mt5_account(telegram_id)
     if not account:
