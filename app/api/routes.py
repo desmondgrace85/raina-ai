@@ -44,31 +44,6 @@ def get_provider() -> DataProvider:
 @router.get("/health")
 async def health():
     return {"status": "ok", "data_provider": settings.data_provider}
-
-
-@router.get("/telegram/chatid")
-async def telegram_chatid():
-    """
-    Helper: shows Chat IDs of everyone who has messaged the bot.
-    Step 1 — Send /start to your bot in Telegram.
-    Step 2 — Visit this endpoint.
-    Step 3 — Copy your chat_id and save it as the TELEGRAM_CHAT_ID secret.
-    """
-    from app.telegram.bot import _seen_chats
-    if not _seen_chats:
-        return {
-            "instruction": (
-                "No chats seen yet. Open Telegram, find your bot, and send /start. "
-                "Then reload this page."
-            ),
-            "chats": [],
-        }
-    return {
-        "instruction": "Save the correct chat_id below as your TELEGRAM_CHAT_ID secret.",
-        "chats": _seen_chats,
-    }
-
-
 @router.get("/symbols")
 async def symbols():
     return {"symbols": await get_provider().get_available_symbols()}
