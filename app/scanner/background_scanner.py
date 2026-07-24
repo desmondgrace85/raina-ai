@@ -36,13 +36,14 @@ async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
     from app.storage.signal_repo import save_signal
     from app.storage.supabase_push import push_signal_to_supabase
 
-      # Build {symbol: [user_ids]} from user-selected markets
-      symbol_to_users = {}
-      try:
-          symbol_to_users = await get_symbol_to_users()
-      except Exception as _e:
-          logger.warning(f"Could not load user markets: {_e}")
-      watchlist = list(symbol_to_users.keys()) if symbol_to_users else settings.default_watchlist
+    # Build {symbol: [user_ids]} from user-selected markets
+    symbol_to_users = {}
+    try:
+        from app.storage.supabase_push import get_symbol_to_users
+        symbol_to_users = await get_symbol_to_users()
+    except Exception as _e:
+        logger.warning(f"Could not load user markets: {_e}")
+    watchlist = list(symbol_to_users.keys()) if symbol_to_users else settings.default_watchlist
     
     try:
         signals: list[Signal] = await multi_market_scanner.scan(
