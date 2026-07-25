@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS signals (
     stop_loss       REAL,
     take_profit     TEXT,
     explanation     TEXT,
-    generated_at    TEXT    NOT NULL
+    generated_at    TEXT    NOT NULL,
+    sent_telegram   INTEGER NOT NULL DEFAULT 0
 );
 """
 

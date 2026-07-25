@@ -48,21 +48,6 @@ async def startup():
     from app.storage.database import init_db
     await init_db()
 
-    # Seed admin user — always force premium/active so owner is never gated
-    import os
-    admin_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if admin_chat_id:
-        from app.storage.user_repo import upsert_user, get_user
-        existing = await get_user(int(admin_chat_id))
-        await upsert_user(
-            telegram_id=int(admin_chat_id),
-            telegram_name="Admin",
-            email=existing.get("email", "admin@rainx.app") if existing else "admin@rainx.app",
-            subscription="premium",
-            is_active=True,
-        )
-        print(f"✅ Admin user set to premium (chat_id={admin_chat_id})", flush=True)
-
     provider = _build_provider()
     set_provider(provider)
     chat_set_provider(provider)
@@ -96,12 +81,6 @@ async def startup():
             await mark_disconnected_stale(minutes=5)
     asyncio.create_task(_stale_sweeper())
 
-    # Start Telegram bot in background so healthcheck isn't blocked
-    async def _start_bot_bg():
-        from app.telegram.bot import start_bot
-        await start_bot(provider)
-    asyncio.create_task(_start_bot_bg())
-
     # Start News Flow community news bot
     from app.news_bot.news_flow import start_news_flow
     start_news_flow()
@@ -114,9 +93,6 @@ async def shutdown():
 
     from app.scanner.background_scanner import stop_background_scanner
     stop_background_scanner()
-
-    from app.telegram.bot import stop_bot
-    await stop_bot()
 
     from app.storage.database import close_db
     await close_db()
