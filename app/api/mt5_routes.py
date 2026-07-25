@@ -18,12 +18,21 @@ Website sync endpoints:
   GET  /mt5/performance/{user_id}
   POST /mt5/scalping/toggle    — enable/disable background auto-scalping
   POST /mt5/scalping/execute   — immediately execute a single scalp trade via MetaAPI
+
+Symbol handling:
+  Raina AI operates on canonical symbols (BTCUSD, XAUUSD, EURUSD…).
+  Each user's MT5 broker may use a different variant for the same asset:
+    BTCUSDZ, BTCUSDm, BTCUSDT, XAUUSD+, EURUSDr …
+  When a user connects, we auto-detect and store their broker_symbol_suffix.
+  All trade orders sent via MetaAPI use that suffix so the broker accepts them.
 """
 import asyncio
 import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from app.models.mt5 import TradeClose, TradeResult, EAHeartbeat
+from app.mt5.symbol_utils import normalize_for_data, detect_broker_suffix, to_broker_symbol
 from app.storage import mt5_repo
 
 logger = logging.getLogger(__name__)
@@ -82,6 +91,10 @@ class MetaApiConnectPayload(BaseModel):
     mt5_server: str
     account_mode: str = 'demo'
     name: str = 'RainaAI User'
+    # Optional: the exact symbol as it appears on the user's MT5 terminal.
+    # Used to auto-detect their broker's symbol suffix (e.g. "BTCUSDZ" → suffix "Z").
+    # If omitted, suffix defaults to "" (canonical symbols used for trading).
+    sample_symbol: Optional[str] = None
 
 
 @router.post('/connect/metaapi')
@@ -90,9 +103,21 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
     Provision the MetaAPI cloud account and return immediately.
     user_id is derived from mt5_login — no Telegram ID needed.
     The frontend polls GET /mt5/account/{user_id} for live status.
+
+    broker_symbol_suffix is auto-detected from sample_symbol if provided,
+    and stored so all trade orders use the user's exact broker symbol format.
     """
     from app.mt5.metaapi_client import provision_account, get_account_info
     user_id = payload.mt5_login  # broker account number is unique per user
+
+    # Detect broker symbol suffix from the sample symbol (e.g. BTCUSDZ → "Z")
+    broker_suffix = ""
+    if payload.sample_symbol:
+        broker_suffix = detect_broker_suffix(payload.sample_symbol)
+        logger.info(
+            f"Detected broker suffix '{broker_suffix}' from sample_symbol "
+            f"'{payload.sample_symbol}' for user {user_id}"
+        )
 
     try:
         metaapi_id = await provision_account(
@@ -113,13 +138,18 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         broker_name=payload.mt5_server,
     )
 
+    # Persist broker suffix in settings so trade executor can look it up
+    if broker_suffix:
+        existing_settings = await mt5_repo.get_settings(user_id)
+        existing_settings["broker_symbol_suffix"] = broker_suffix
+        await mt5_repo.upsert_settings(user_id, existing_settings)
+
     # Background task: wait for broker sync then update balance/equity
     async def _sync_later():
         try:
             await asyncio.sleep(90)
             info = await get_account_info(metaapi_id)
             if info and info.get("connected"):
-                # FIX: use update_metaapi_heartbeat so balance/equity are saved
                 await mt5_repo.update_metaapi_heartbeat(
                     metaapi_id=metaapi_id,
                     broker=info.get("broker") or payload.mt5_server,
@@ -145,6 +175,7 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         'broker_name': payload.mt5_server,
         'account_number': payload.mt5_login,
         'account_mode': payload.account_mode,
+        'broker_symbol_suffix': broker_suffix,
     }
 
 
@@ -192,6 +223,10 @@ class SettingsPayload(BaseModel):
     scalping_enabled: bool = False
     min_confidence: float = 70.0
     daily_loss_limit: float = 5.0
+    # Broker-specific symbol suffix — set once so trades use the right symbol.
+    # Example: if your MT5 shows "BTCUSDZ", set suffix to "Z".
+    # Leave blank if your broker uses standard symbols (BTCUSD, XAUUSD, etc.).
+    broker_symbol_suffix: str = ""
 
 
 @router.post("/settings")
@@ -224,9 +259,13 @@ async def toggle_scalping(payload: ScalpToggle):
 
 class ScalpExecutePayload(BaseModel):
     user_id: str
-    symbol: str
-    direction: str   # "BUY" or "SELL"
+    symbol: str         # canonical OR broker-specific — we normalize either way
+    direction: str      # "BUY" or "SELL"
     confidence: float = 70.0
+    # Optional override: exact broker symbol to use for this trade.
+    # If omitted, Raina AI looks up the user's stored broker_symbol_suffix
+    # and constructs the broker symbol automatically.
+    broker_symbol_override: Optional[str] = None
 
 
 @router.post("/scalping/execute")
@@ -234,6 +273,13 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
     """
     Immediately execute a scalp trade for a specific user+signal via MetaAPI.
     Called by the RainX app for Quick Scalp and Smart Scalp signal execution.
+
+    Symbol resolution:
+      1. If broker_symbol_override is set, use it directly.
+      2. Otherwise normalize the incoming symbol to canonical (BTCUSDZ → BTCUSD),
+         then re-apply the user's stored broker suffix (BTCUSD + Z → BTCUSDZ).
+      This ensures MetaAPI sends the exact symbol name the broker recognises,
+      regardless of what variant the frontend passes.
     """
     from app.mt5.metaapi_client import place_trade
     from app.mt5.risk_calculator import calculate_lot_size
@@ -255,12 +301,26 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             detail="MetaAPI not connected — use EA mode or reconnect via MetaAPI"
         )
 
-    # Load risk settings
+    # Load risk settings (includes broker_symbol_suffix)
     settings_raw = await mt5_repo.get_settings(payload.user_id)
-    _risk_fields = {"risk_percent", "max_open_trades", "min_confidence",
-                    "daily_loss_limit", "max_daily_loss_percent"}
     risk_kwargs = {k: v for k, v in settings_raw.items() if k in RiskSettings.model_fields}
     settings = RiskSettings(**risk_kwargs)
+
+    # ── Resolve the exact broker symbol for this trade ────────────────────────
+    if payload.broker_symbol_override:
+        # Explicit override from frontend (most precise)
+        broker_symbol = payload.broker_symbol_override
+    else:
+        # Normalise the incoming symbol to canonical, then apply stored suffix
+        canonical = normalize_for_data(payload.symbol.upper())
+        stored_suffix = settings_raw.get("broker_symbol_suffix", "")
+        broker_symbol = to_broker_symbol(canonical, stored_suffix)
+
+    logger.info(
+        f"[execute] Symbol resolution: "
+        f"input={payload.symbol!r} → broker_symbol={broker_symbol!r} "
+        f"(suffix={settings_raw.get('broker_symbol_suffix', '')!r})"
+    )
 
     # Confidence gate
     if payload.confidence < settings.min_confidence:
@@ -285,26 +345,28 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
         raise HTTPException(status_code=400, detail="Daily loss limit reached — trading paused")
 
     balance = account.get("balance") or 1000.0
-    lot = calculate_lot_size(payload.symbol, balance, settings, None)
+    lot = calculate_lot_size(broker_symbol, balance, settings, None)
 
-    # Insert a pending order record
+    # Insert a pending order record (store canonical symbol for internal tracking)
+    canonical_for_record = normalize_for_data(payload.symbol.upper())
     api_key = account.get("api_key", "")
     order = TradeOrder(
         user_id=payload.user_id,
         api_key=api_key,
-        asset=payload.symbol,
+        asset=canonical_for_record,
         direction=TradeDirection(direction),
         lot_size=lot,
         confidence=payload.confidence,
         timeframe="5m",
+        comment=f"RainX | {broker_symbol}",
     )
     order_id = await mt5_repo.insert_trade_order(order)
 
-    # Place the trade via MetaAPI
+    # Place the trade via MetaAPI using the resolved broker symbol
     try:
         result = await place_trade(
             metaapi_id=metaapi_id,
-            symbol=payload.symbol,
+            symbol=broker_symbol,   # ← broker's exact symbol name
             direction=direction,
             lot_size=lot,
             stop_loss=None,
@@ -321,13 +383,14 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
         )
         logger.info(
             f"[execute] Trade opened for {payload.user_id}: "
-            f"{payload.symbol} {direction} lot={lot} ticket={result['ticket']}"
+            f"{broker_symbol} {direction} lot={lot} ticket={result['ticket']}"
         )
         return {
             "ok": True,
             "ticket": result["ticket"],
             "lot_size": lot,
             "open_price": result.get("open_price"),
+            "broker_symbol": broker_symbol,
         }
     else:
         await mt5_repo.mark_trade_failed(order_id, result.get("error", ""))

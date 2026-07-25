@@ -18,6 +18,7 @@ from app.config import settings
 from app.data_providers.base import DataProvider
 from app.engines import long_term_engine, scalping_engine
 from app.models.signal import Signal
+from app.mt5.symbol_utils import normalize_for_data
 from app.scanner import multi_market_scanner
 from app.storage.database import get_db
 
@@ -44,6 +45,7 @@ def get_provider() -> DataProvider:
 @router.get("/health")
 async def health():
     return {"status": "ok", "data_provider": settings.data_provider}
+
 @router.get("/symbols")
 async def symbols():
     return {"symbols": await get_provider().get_available_symbols()}
@@ -51,12 +53,15 @@ async def symbols():
 
 @router.get("/signals/long-term/{symbol}", response_model=Signal)
 async def long_term_signal(symbol: str, timeframe: str = Query(default="4h")):
-    return await long_term_engine.generate_signal(get_provider(), symbol.upper(), timeframe)
+    # normalize_for_data handles any broker variant: BTCUSDZ, BTCUSDm, BTCUSDT etc.
+    canonical = normalize_for_data(symbol.upper())
+    return await long_term_engine.generate_signal(get_provider(), canonical, timeframe)
 
 
 @router.get("/signals/scalp/{symbol}", response_model=Signal)
 async def scalp_signal(symbol: str, timeframe: str = Query(default="5m")):
-    return await scalping_engine.generate_signal(get_provider(), symbol.upper(), timeframe)
+    canonical = normalize_for_data(symbol.upper())
+    return await scalping_engine.generate_signal(get_provider(), canonical, timeframe)
 
 
 @router.get("/scan/long-term", response_model=list[Signal])
@@ -163,7 +168,7 @@ async def webhook_user_stats():
 async def live_price(symbol: str = Query(...)):
     """Latest price for any supported symbol via the active data provider."""
     provider = get_provider()
-    sym = symbol.upper()
+    sym = normalize_for_data(symbol.upper())
     try:
         # Get the most recent candle — works for Binance, Yahoo v8, etc.
         candles = await provider.get_candles(sym, "1m", limit=1)
@@ -199,8 +204,9 @@ async def candle_series(
     before_dt: Optional[datetime] = (
         datetime.fromtimestamp(before, tz=timezone.utc) if before else None
     )
+    canonical = normalize_for_data(symbol.upper())
     try:
-        candles = await provider.get_candles(symbol.upper(), tf, limit=limit, before=before_dt)
+        candles = await provider.get_candles(canonical, tf, limit=limit, before=before_dt)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     values = [
@@ -213,7 +219,7 @@ async def candle_series(
         }
         for c in reversed(candles)  # newest first
     ]
-    return {"values": values, "symbol": symbol.upper(), "interval": interval}
+    return {"values": values, "symbol": canonical, "interval": interval}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,12 +405,12 @@ async def track_signal(
 ):
     """Track an active trade — returns current pip P&L and TP/SL hit status."""
     provider = get_provider()
+    sym = normalize_for_data(symbol.upper())
     try:
-        bars = await provider.get_ohlcv(symbol.upper(), "1m", limit=1)
+        bars = await provider.get_ohlcv(sym, "1m", limit=1)
         if not bars:
             raise HTTPException(status_code=404, detail="Price not available")
         current = float(bars[-1]["close"])
-        sym = symbol.upper()
         if "JPY" in sym: pip = 0.01
         elif any(x in sym for x in ["BTC","ETH","BNB","SOL"]): pip = 1.0
         elif "XAU" in sym: pip = 0.1

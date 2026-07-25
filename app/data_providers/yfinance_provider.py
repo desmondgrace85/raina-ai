@@ -5,6 +5,9 @@ Covers Forex, Crypto, Gold, and Commodities with zero API keys.
 Symbols are mapped from Raina AI's internal naming to yfinance tickers.
 
 Robustness features:
+  • Smart symbol normalisation: strips broker suffixes (BTCUSDZ→BTCUSD),
+    USDT variants (BTCUSDT→BTCUSD), and other MT5 broker qualifiers before
+    looking up the yfinance ticker — so any user's MT5 symbol just works.
   • Multi-period fallback: tries progressively shorter periods if the
     primary period returns no data (common for futures/forex on 1h)
   • Ticker.history() fallback when yf.download() fails
@@ -20,10 +23,11 @@ import yfinance as yf
 
 from app.data_providers.base import DataProvider
 from app.models.signal import Candle
+from app.mt5.symbol_utils import normalize_for_data
 
 logger = logging.getLogger(__name__)
 
-# Internal symbol → yfinance ticker
+# Canonical internal symbol → yfinance ticker
 _SYMBOL_MAP: dict[str, str] = {
     # Forex
     "EURUSD":   "EURUSD=X",
@@ -35,7 +39,7 @@ _SYMBOL_MAP: dict[str, str] = {
     "NZDUSD":   "NZDUSD=X",
     "GBPJPY":   "GBPJPY=X",
     "EURJPY":   "EURJPY=X",
-    # Crypto (both USD and USDT variants)
+    # Crypto — all map to USD-quoted tickers (USDT variants normalised upstream)
     "BTCUSD":   "BTC-USD",
     "BTCUSDT":  "BTC-USD",
     "ETHUSD":   "ETH-USD",
@@ -78,7 +82,7 @@ _YF_PERIOD_CHAIN: dict[str, list[str]] = {
     "1m":  ["7d"],
     "5m":  ["60d", "30d"],
     "15m": ["60d", "30d"],
-    "1h":  ["365d", "180d", "90d", "60d"],   # multiple fallbacks
+    "1h":  ["365d", "180d", "90d", "60d"],
     "4h":  ["365d", "180d", "90d", "60d"],
     "1d":  ["5y", "2y", "1y"],
 }
@@ -202,7 +206,19 @@ class YFinanceProvider(DataProvider):
     async def get_candles(
         self, symbol: str, timeframe: str, limit: int = 200, before=None
     ) -> list[Candle]:
-        ticker = _SYMBOL_MAP.get(symbol.upper(), symbol)
+        # Normalise broker-specific variants → canonical → yfinance ticker
+        # e.g. BTCUSDZ → BTCUSD → BTC-USD
+        #      BTCUSDT → BTCUSD → BTC-USD
+        #      BTCUSDm → BTCUSD → BTC-USD
+        canonical = normalize_for_data(symbol.upper())
+        ticker = _SYMBOL_MAP.get(canonical, canonical)
+
+        if ticker == canonical and canonical not in _SYMBOL_MAP:
+            logger.warning(
+                f"No yfinance ticker mapping for symbol={symbol!r} "
+                f"(canonical={canonical!r}) — attempting to use as-is"
+            )
+
         yf_interval = _YF_INTERVAL.get(timeframe, "1h")
         periods = _YF_PERIOD_CHAIN.get(timeframe, ["60d"])
 
@@ -213,11 +229,11 @@ class YFinanceProvider(DataProvider):
                 lambda: _download_with_fallback(ticker, yf_interval, periods),
             )
         except Exception as e:
-            logger.error(f"Data fetch error {symbol} ({ticker}) [{timeframe}]: {e}")
+            logger.error(f"Data fetch error {symbol} (canonical={canonical}, ticker={ticker}) [{timeframe}]: {e}")
             return []
 
         if df is None or df.empty:
-            logger.warning(f"No data returned for {symbol} ({ticker}) [{timeframe}]")
+            logger.warning(f"No data returned for {symbol} (canonical={canonical}, ticker={ticker}) [{timeframe}]")
             return []
 
         # Flatten MultiIndex columns (handles both old and new yfinance formats)
@@ -236,5 +252,5 @@ class YFinanceProvider(DataProvider):
             df = _resample_to_4h(df)
 
         candles = _df_to_candles(df, limit)
-        logger.debug(f"[yfinance] {symbol} [{timeframe}] → {len(candles)} clean candles")
+        logger.debug(f"[yfinance] {symbol} → {canonical} → {ticker} [{timeframe}] → {len(candles)} clean candles")
         return candles
