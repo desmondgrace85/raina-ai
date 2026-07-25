@@ -2,11 +2,12 @@
 SQLite database initialisation for Raina AI.
 
 Tables:
-  signals        — every signal generated (history)
-  telegram_users — authenticated Telegram users & subscription tier
-  mt5_accounts   — per-user MT5 EA connection state
-  mt5_settings   — per-user risk/scalping settings
-  mt5_trades     — trade orders, open positions, closed history
+  signals              — every signal generated (history)
+  mt5_accounts         — per-user MT5 EA connection state
+  mt5_settings         — per-user risk/scalping settings
+  mt5_trades           — trade orders, open positions, closed history
+  push_subscriptions   — web push notification subscriptions
+  user_active_markets  — per-user watched symbols
 """
 import logging
 import os
@@ -34,29 +35,14 @@ CREATE TABLE IF NOT EXISTS signals (
     stop_loss       REAL,
     take_profit     TEXT,
     explanation     TEXT,
-    generated_at    TEXT    NOT NULL,
-    sent_telegram   INTEGER NOT NULL DEFAULT 0
-);
-"""
-
-_CREATE_USERS = """
-CREATE TABLE IF NOT EXISTS telegram_users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id     INTEGER UNIQUE NOT NULL,
-    telegram_name   TEXT,
-    email           TEXT,
-    subscription    TEXT    NOT NULL DEFAULT 'none',
-    is_active       INTEGER NOT NULL DEFAULT 0,
-    rainx_token     TEXT,
-    created_at      TEXT    NOT NULL,
-    last_seen       TEXT
+    generated_at    TEXT    NOT NULL
 );
 """
 
 _CREATE_MT5_ACCOUNTS = """
 CREATE TABLE IF NOT EXISTS mt5_accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id     INTEGER UNIQUE NOT NULL,
+    user_id         TEXT    UNIQUE NOT NULL,
     api_key         TEXT    UNIQUE NOT NULL,
     metaapi_id      TEXT,
     account_mode    TEXT    NOT NULL DEFAULT 'demo',
@@ -72,15 +58,15 @@ CREATE TABLE IF NOT EXISTS mt5_accounts (
 
 _CREATE_MT5_SETTINGS = """
 CREATE TABLE IF NOT EXISTS mt5_settings (
-    telegram_id     INTEGER PRIMARY KEY,
-    settings_json   TEXT NOT NULL DEFAULT '{}'
+    user_id         TEXT    PRIMARY KEY,
+    settings_json   TEXT    NOT NULL DEFAULT '{}'
 );
 """
 
 _CREATE_MT5_TRADES = """
 CREATE TABLE IF NOT EXISTS mt5_trades (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id     INTEGER NOT NULL,
+    user_id         TEXT    NOT NULL,
     api_key         TEXT    NOT NULL,
     asset           TEXT    NOT NULL,
     direction       TEXT    NOT NULL,
@@ -129,9 +115,8 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_signals_asset  ON signals(asset);",
     "CREATE INDEX IF NOT EXISTS idx_signals_engine ON signals(engine);",
     "CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(generated_at DESC);",
-    "CREATE INDEX IF NOT EXISTS idx_users_tgid     ON telegram_users(telegram_id);",
-    "CREATE INDEX IF NOT EXISTS idx_users_sub      ON telegram_users(subscription, is_active);",
-    "CREATE INDEX IF NOT EXISTS idx_mt5_trades_tid ON mt5_trades(telegram_id, status);",
+    "CREATE INDEX IF NOT EXISTS idx_mt5_accounts_uid ON mt5_accounts(user_id);",
+    "CREATE INDEX IF NOT EXISTS idx_mt5_trades_uid ON mt5_trades(user_id, status);",
     "CREATE INDEX IF NOT EXISTS idx_mt5_trades_key ON mt5_trades(api_key, status);",
     "CREATE INDEX IF NOT EXISTS idx_push_uid       ON push_subscriptions(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_uam_uid        ON user_active_markets(user_id);",
@@ -147,7 +132,6 @@ async def init_db() -> None:
     _db.row_factory = aiosqlite.Row
     await _db.execute("PRAGMA journal_mode=WAL;")
     await _db.execute(_CREATE_SIGNALS)
-    await _db.execute(_CREATE_USERS)
     await _db.execute(_CREATE_MT5_ACCOUNTS)
     await _db.execute(_CREATE_MT5_SETTINGS)
     await _db.execute(_CREATE_MT5_TRADES)

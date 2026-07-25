@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 async def queue_signal_for_all(signal: Signal) -> int:
-    """Execute or queue a signal for every eligible premium user."""
+    """Execute or queue a signal for every eligible user with scalping enabled."""
     if signal.direction.value == "HOLD":
         return 0
 
@@ -24,9 +24,9 @@ async def queue_signal_for_all(signal: Signal) -> int:
         settings = RiskSettings(**user["settings"])
         if signal.confidence < settings.min_confidence:
             continue
-        if await mt5_repo.daily_loss_exceeded(user["telegram_id"], settings):
+        if await mt5_repo.daily_loss_exceeded(user["user_id"], settings):
             continue
-        if await mt5_repo.open_trade_count(user["telegram_id"]) >= settings.max_open_trades:
+        if await mt5_repo.open_trade_count(user["user_id"]) >= settings.max_open_trades:
             continue
 
         balance = user.get("balance") or 1000.0
@@ -38,7 +38,7 @@ async def queue_signal_for_all(signal: Signal) -> int:
         tp  = signal.take_profit[0] if signal.take_profit else None
 
         order = TradeOrder(
-            telegram_id=user["telegram_id"],
+            user_id=user["user_id"],
             api_key=user.get("api_key", ""),
             asset=signal.asset,
             direction=TradeDirection(signal.direction.value),
@@ -54,7 +54,6 @@ async def queue_signal_for_all(signal: Signal) -> int:
         metaapi_id = user.get("metaapi_id")
 
         if metaapi_id:
-            # Mobile path — MetaAPI cloud execution
             try:
                 from app.mt5.metaapi_client import place_trade
                 result = await place_trade(
@@ -71,29 +70,25 @@ async def queue_signal_for_all(signal: Signal) -> int:
                         result["ticket"], result.get("open_price", 0),
                     )
                     executed += 1
-                    logger.info(f"[MetaAPI] Trade opened for {user['telegram_id']}: {signal.asset} {signal.direction.value}")
+                    logger.info(f"[MetaAPI] Trade opened for {user['user_id']}: {signal.asset} {signal.direction.value}")
                 else:
                     await mt5_repo.mark_trade_failed(order_id, result.get("error", ""))
             except Exception as e:
-                logger.error(f"[MetaAPI] Error for {user['telegram_id']}: {e}")
+                logger.error(f"[MetaAPI] Error for {user['user_id']}: {e}")
         else:
-            # Desktop path — mark as pending, EA will poll and pick it up
-            logger.info(f"[EA] Queued trade for {user['telegram_id']}: {signal.asset} {signal.direction.value}")
-            executed += 1  # counted as queued
+            logger.info(f"[EA] Queued trade for {user['user_id']}: {signal.asset} {signal.direction.value}")
+            executed += 1
 
     return executed
 
 
 async def confirm_trade(api_key: str, order_id: int, ticket: int, open_price: float) -> bool:
-    """Called when the desktop EA confirms it opened a trade."""
     return await mt5_repo.update_trade_opened(api_key, order_id, ticket, open_price)
 
 
 async def close_trade(api_key: str, ticket: int, close_price: float, profit: float) -> bool:
-    """Called when the desktop EA reports a trade closed."""
     return await mt5_repo.close_trade(api_key, ticket, close_price, profit)
 
 
-async def cancel_pending_trades(telegram_id: int) -> int:
-    """Cancel all pending/queued trades for a user."""
-    return await mt5_repo.cancel_user_pending_trades(telegram_id)
+async def cancel_pending_trades(user_id: str) -> int:
+    return await mt5_repo.cancel_user_pending_trades(user_id)

@@ -1,5 +1,6 @@
 """
 MT5 data models for RainX auto-trading.
+user_id = mt5_login (broker account number) — no Telegram dependency.
 """
 from datetime import datetime
 from enum import Enum
@@ -18,16 +19,16 @@ class TradeDirection(str, Enum):
 
 
 class TradeStatus(str, Enum):
-    PENDING = "pending"       # queued, waiting for EA to pick up
-    SENT = "sent"             # EA acknowledged
-    OPEN = "open"             # trade is live on MT5
-    CLOSED = "closed"         # trade closed
-    CANCELLED = "cancelled"   # cancelled before execution
-    FAILED = "failed"         # EA reported failure
+    PENDING = "pending"
+    SENT = "sent"
+    OPEN = "open"
+    CLOSED = "closed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 class RiskSettings(BaseModel):
-    risk_percent: float = Field(default=1.0, ge=0.1, le=10.0)   # % of balance per trade
+    risk_percent: float = Field(default=1.0, ge=0.1, le=10.0)
     max_open_trades: int = Field(default=3, ge=1, le=20)
     max_daily_loss_percent: float = Field(default=5.0, ge=1.0, le=50.0)
     scalping_enabled: bool = False
@@ -36,12 +37,12 @@ class RiskSettings(BaseModel):
 
 
 class MT5Account(BaseModel):
-    telegram_id: int
-    api_key: str                      # user's unique EA connection key
+    user_id: str
+    api_key: str
     account_mode: AccountMode = AccountMode.DEMO
-    is_connected: bool = False        # EA has sent a heartbeat recently
+    is_connected: bool = False
     broker_name: Optional[str] = None
-    account_number: Optional[str] = None   # display only, not credentials
+    account_number: Optional[str] = None
     balance: Optional[float] = None
     equity: Optional[float] = None
     last_heartbeat: Optional[datetime] = None
@@ -50,7 +51,7 @@ class MT5Account(BaseModel):
 
 class TradeOrder(BaseModel):
     id: Optional[int] = None
-    telegram_id: int
+    user_id: str
     api_key: str
     signal_id: Optional[int] = None
     asset: str
@@ -62,7 +63,7 @@ class TradeOrder(BaseModel):
     confidence: float
     timeframe: Optional[str] = None
     status: TradeStatus = TradeStatus.PENDING
-    mt5_ticket: Optional[int] = None    # MT5 ticket number after execution
+    mt5_ticket: Optional[int] = None
     open_price: Optional[float] = None
     close_price: Optional[float] = None
     profit: Optional[float] = None
@@ -73,7 +74,6 @@ class TradeOrder(BaseModel):
 
 
 class TradeResult(BaseModel):
-    """Sent back by EA after execution."""
     api_key: str
     order_id: int
     success: bool
@@ -83,7 +83,6 @@ class TradeResult(BaseModel):
 
 
 class TradeClose(BaseModel):
-    """Sent by EA when a trade closes."""
     api_key: str
     mt5_ticket: int
     close_price: float

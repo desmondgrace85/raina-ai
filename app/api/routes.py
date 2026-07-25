@@ -130,40 +130,24 @@ async def webhook_subscription(payload: dict):
 
     Expected payload:
     {
-        "telegram_id": 123456789,
+        "user_id": "81690308",
         "email": "user@example.com",
         "subscription": "standard" | "premium" | "none",
         "is_active": true | false
     }
     """
-    from app.storage.user_repo import upsert_user
-    tid = payload.get("telegram_id")
-    if not tid:
-        raise HTTPException(status_code=400, detail="telegram_id required")
+    user_id = payload.get("user_id") or payload.get("email", "")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
 
-    await upsert_user(
-        telegram_id=int(tid),
-        email=payload.get("email", ""),
-        subscription=payload.get("subscription", "none"),
-        is_active=bool(payload.get("is_active", False)),
-    )
+    # Persist subscription against MT5 settings so scalping can check it later
+    from app.storage import mt5_repo
+    settings = await mt5_repo.get_settings(user_id)
+    settings["subscription"] = payload.get("subscription", "none")
+    settings["is_active"] = bool(payload.get("is_active", False))
+    await mt5_repo.upsert_settings(user_id, settings)
 
-    # Notify the user on Telegram if bot is running
-    from app.telegram.bot import _app
-    if _app:
-        sub = payload.get("subscription", "none")
-        active = bool(payload.get("is_active", False))
-        if active and sub != "none":
-            label = "💎 Premium — MT5 auto-trading enabled" if sub == "premium" else "📊 Standard — Long-term signals active"
-            try:
-                await _app.bot.send_message(
-                    chat_id=tid,
-                    text=f"✅ Subscription activated!\n\n{label}\n\nSignals will arrive here automatically when strong setups appear (65%+ confidence).",
-                )
-            except Exception:
-                pass
-
-    return {"ok": True, "telegram_id": tid}
+    return {"ok": True, "user_id": user_id}
 
 
 @router.get("/webhook/users/stats")

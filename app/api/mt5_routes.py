@@ -1,5 +1,6 @@
 """
 MT5 REST API — supports both EA (desktop) and MetaAPI (mobile) modes.
+user_id = mt5_login (broker account number) — no Telegram dependency.
 
 EA endpoints (keyed by api_key, called by the MQL5 EA):
   GET  /mt5/ea/poll/{api_key}  — EA polls for pending orders
@@ -8,9 +9,13 @@ EA endpoints (keyed by api_key, called by the MQL5 EA):
   POST /mt5/ea/heartbeat       — EA sends account state
 
 Website sync endpoints:
-  POST /mt5/connect, GET /mt5/account/{id}
-  POST /mt5/settings, GET /mt5/settings/{id}
-  GET  /mt5/trades/{id}, /mt5/history/{id}, /mt5/performance/{id}
+  POST /mt5/connect/metaapi    — provision MetaAPI cloud account
+  GET  /mt5/account/{user_id}  — poll connection status
+  POST /mt5/settings           — save risk settings
+  GET  /mt5/settings/{user_id}
+  GET  /mt5/trades/{user_id}
+  GET  /mt5/history/{user_id}
+  GET  /mt5/performance/{user_id}
   POST /mt5/scalping/toggle
 """
 import asyncio
@@ -50,7 +55,7 @@ async def ea_confirm(payload: TradeResult):
 @router.post("/ea/close")
 async def ea_close(payload: TradeClose):
     await mt5_repo.close_trade(
-        payload.api_key, payload.ticket,
+        payload.api_key, payload.mt5_ticket,
         payload.close_price, payload.profit,
     )
     return {"ok": True}
@@ -59,7 +64,7 @@ async def ea_close(payload: TradeClose):
 @router.post("/ea/heartbeat")
 async def ea_heartbeat(payload: EAHeartbeat):
     ok = await mt5_repo.update_heartbeat(
-        payload.api_key, payload.broker,
+        payload.api_key, payload.broker_name,
         payload.account_number, payload.balance,
         payload.equity, payload.account_mode,
     )
@@ -68,36 +73,26 @@ async def ea_heartbeat(payload: EAHeartbeat):
     return {"ok": True}
 
 
-# ── Account ────────────────────────────────────────────────────────────────────
-
-class ConnectPayload(BaseModel):
-    telegram_id: int
-    account_mode: str = "demo"
-
-@router.post("/connect")
-async def connect(payload: ConnectPayload):
-    api_key = await mt5_repo.upsert_mt5_account(payload.telegram_id, payload.account_mode)
-    return {"api_key": api_key, "account_mode": payload.account_mode}
-
 # ── MetaAPI (cloud) connect ───────────────────────────────────────────────────
 
 class MetaApiConnectPayload(BaseModel):
-    telegram_id: int
     mt5_login: str
     mt5_password: str
     mt5_server: str
     account_mode: str = 'demo'
     name: str = 'RainaAI User'
 
+
 @router.post('/connect/metaapi')
 async def connect_metaapi(payload: MetaApiConnectPayload):
     """
     Provision the MetaAPI cloud account and return immediately.
-    We do NOT wait for full synchronization here — a freshly provisioned
-    MetaAPI cloud terminal takes 60-120 s to connect to the broker.
-    The frontend should poll GET /mt5/account/{telegram_id} for live status.
+    user_id is derived from mt5_login — no Telegram ID needed.
+    The frontend polls GET /mt5/account/{user_id} for live status.
     """
     from app.mt5.metaapi_client import provision_account, get_account_info
+    user_id = payload.mt5_login  # broker account number is unique per user
+
     try:
         metaapi_id = await provision_account(
             mt5_login=payload.mt5_login,
@@ -109,97 +104,103 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f'MetaAPI provisioning failed: {str(e)}')
 
-    # Persist the account record immediately so the user sees "connected"
     api_key = await mt5_repo.upsert_mt5_account_full(
-        telegram_id=payload.telegram_id,
+        user_id=user_id,
         account_mode=payload.account_mode,
         metaapi_id=metaapi_id,
         account_number=payload.mt5_login,
         broker_name=payload.mt5_server,
     )
 
-    # Fire-and-forget: fetch live info once the terminal syncs (non-blocking)
+    # Background task: wait for broker sync then update balance/equity
     async def _sync_later():
         try:
-            await asyncio.sleep(90)   # give MetaAPI time to connect to broker
+            await asyncio.sleep(90)
             info = await get_account_info(metaapi_id)
-            if info.get("connected"):
+            if info:
                 await mt5_repo.upsert_mt5_account_full(
-                    telegram_id=payload.telegram_id,
+                    user_id=user_id,
                     account_mode=payload.account_mode,
                     metaapi_id=metaapi_id,
-                    account_number=payload.mt5_login,
+                    account_number=info.get("login") or payload.mt5_login,
                     broker_name=info.get("broker") or payload.mt5_server,
                 )
-                logger.info(f"MetaAPI account {metaapi_id} sync confirmed for user {payload.telegram_id}")
-        except Exception as e:
-            logger.warning(f"Background MetaAPI sync failed for {metaapi_id}: {e}")
+                logger.info(f"MetaAPI account {metaapi_id} sync confirmed for user {user_id}")
+        except Exception as ex:
+            logger.warning(f"Background MetaAPI sync failed for {user_id}: {ex}")
 
     asyncio.create_task(_sync_later())
 
     return {
+        'connected': True,
+        'user_id': user_id,
         'api_key': api_key,
         'metaapi_id': metaapi_id,
-        'account_mode': payload.account_mode,
         'broker_name': payload.mt5_server,
         'account_number': payload.mt5_login,
-        'balance': None,
-        'connected': True,   # provisioning succeeded; terminal syncs in background
+        'account_mode': payload.account_mode,
     }
 
 
-@router.get('/account/{telegram_id}')
-async def get_account(telegram_id: int):
-    account = await mt5_repo.get_mt5_account(telegram_id)
+# ── Account status ─────────────────────────────────────────────────────────────
+
+@router.get('/account/{user_id}')
+async def get_account(user_id: str):
+    account = await mt5_repo.get_mt5_account(user_id)
     if not account:
-        raise HTTPException(status_code=404, detail="No MT5 account found")
+        raise HTTPException(status_code=404, detail='Account not found')
     return account
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 class SettingsPayload(BaseModel):
-    telegram_id: int
+    user_id: str
     risk_percent: float = 1.0
     max_open_trades: int = 3
     scalping_enabled: bool = False
     min_confidence: float = 70.0
     daily_loss_limit: float = 5.0
 
+
 @router.post("/settings")
 async def save_settings(payload: SettingsPayload):
-    settings = payload.model_dump(exclude={"telegram_id"})
-    await mt5_repo.upsert_settings(payload.telegram_id, settings)
+    settings = payload.model_dump(exclude={"user_id"})
+    await mt5_repo.upsert_settings(payload.user_id, settings)
     return {"ok": True}
 
-@router.get("/settings/{telegram_id}")
-async def get_settings(telegram_id: int):
-    return await mt5_repo.get_settings(telegram_id)
+
+@router.get("/settings/{user_id}")
+async def get_settings(user_id: str):
+    return await mt5_repo.get_settings(user_id)
 
 
 # ── Scalping toggle ───────────────────────────────────────────────────────────
 
 class ScalpToggle(BaseModel):
-    telegram_id: int
+    user_id: str
+
 
 @router.post("/scalping/toggle")
 async def toggle_scalping(payload: ScalpToggle):
-    settings = await mt5_repo.get_settings(payload.telegram_id)
+    settings = await mt5_repo.get_settings(payload.user_id)
     settings["scalping_enabled"] = not settings.get("scalping_enabled", False)
-    await mt5_repo.upsert_settings(payload.telegram_id, settings)
+    await mt5_repo.upsert_settings(payload.user_id, settings)
     return {"scalping_enabled": settings["scalping_enabled"]}
 
 
 # ── Trades ────────────────────────────────────────────────────────────────────
 
-@router.get("/trades/{telegram_id}")
-async def get_trades(telegram_id: int):
-    return {"trades": await mt5_repo.get_open_trades(telegram_id)}
+@router.get("/trades/{user_id}")
+async def get_trades(user_id: str):
+    return {"trades": await mt5_repo.get_open_trades(user_id)}
 
-@router.get("/history/{telegram_id}")
-async def get_history(telegram_id: int, limit: int = 20):
-    return {"history": await mt5_repo.get_trade_history(telegram_id, limit=limit)}
 
-@router.get("/performance/{telegram_id}")
-async def get_performance(telegram_id: int):
-    return await mt5_repo.get_performance_summary(telegram_id)
+@router.get("/history/{user_id}")
+async def get_history(user_id: str, limit: int = 20):
+    return {"history": await mt5_repo.get_trade_history(user_id, limit=limit)}
+
+
+@router.get("/performance/{user_id}")
+async def get_performance(user_id: str):
+    return await mt5_repo.get_performance_summary(user_id)
