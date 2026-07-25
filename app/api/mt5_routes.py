@@ -10,7 +10,8 @@ EA endpoints (keyed by api_key, called by the MQL5 EA):
 
 Website sync endpoints:
   POST /mt5/connect/metaapi    — provision MetaAPI cloud account
-  GET  /mt5/account/{user_id}  — poll connection status (fetches live balance when missing)
+  GET  /mt5/account/{user_id}  — poll connection status (fast — returns stored value)
+  POST /mt5/balance/refresh/{user_id} — force a background balance re-fetch from MetaAPI
   POST /mt5/settings           — save risk settings
   GET  /mt5/settings/{user_id}
   GET  /mt5/trades/{user_id}
@@ -19,24 +20,100 @@ Website sync endpoints:
   POST /mt5/scalping/toggle    — enable/disable background auto-scalping
   POST /mt5/scalping/execute   — immediately execute a single scalp trade via MetaAPI
 
-Symbol handling:
-  Raina AI operates on canonical symbols (BTCUSD, XAUUSD, EURUSD…).
-  Each user's MT5 broker may use a different variant for the same asset:
-    BTCUSDZ, BTCUSDm, BTCUSDT, XAUUSD+, EURUSDr …
-  When a user connects, we auto-detect and store their broker_symbol_suffix.
-  All trade orders sent via MetaAPI use that suffix so the broker accepts them.
+Balance sync strategy
+---------------------
+Exness (and other brokers) take 60-180 seconds for a freshly deployed MetaAPI
+terminal to fully synchronise with the broker.  We must NOT block the API
+response waiting for that sync.  Instead:
+
+  • GET /mt5/account/{id}   → always returns the stored value immediately.
+  • A background coroutine  → retries with a generous (90 s) wait_synchronized
+    timeout until the balance is persisted.  Retries up to 8 times with
+    exponential-ish back-off (total window ~90 minutes).
+  • POST /mt5/balance/refresh/{id} → lets the frontend trigger a fresh
+    background sync on demand (e.g. when user taps "Sync Balance").
 """
 import asyncio
 import logging
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+
 from app.models.mt5 import TradeClose, TradeResult, EAHeartbeat
 from app.mt5.symbol_utils import normalize_for_data, detect_broker_suffix, to_broker_symbol
 from app.storage import mt5_repo
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mt5", tags=["mt5"])
+
+
+# ── Balance sync helper ────────────────────────────────────────────────────────
+
+async def _sync_balance_with_retry(
+    metaapi_id: str,
+    user_id: str,
+    account_mode: str,
+    broker_name: str,
+    login: str,
+    max_attempts: int = 8,
+) -> None:
+    """
+    Background coroutine: keep trying to fetch the live balance from MetaAPI
+    until it succeeds, then persist it to Supabase.
+
+    Retry schedule (initial delay before first attempt, then between attempts):
+      90s → 120s → 180s → 300s → 300s → 600s → 600s → 600s
+    This gives a ~50-minute window — long enough for most broker deployments.
+    """
+    from app.mt5.metaapi_client import get_account_info
+
+    delays = [90, 120, 180, 300, 300, 600, 600, 600]
+
+    for attempt, delay in enumerate(delays[:max_attempts], 1):
+        await asyncio.sleep(delay)
+        try:
+            # Use a 90 s wait_synchronized — Exness often needs 60-90 s on first deploy
+            info = await get_account_info(metaapi_id, sync_timeout_seconds=90)
+
+            if info.get("connected") and info.get("balance") is not None:
+                await mt5_repo.update_metaapi_heartbeat(
+                    metaapi_id=metaapi_id,
+                    broker=info.get("broker") or broker_name,
+                    account_number=info.get("login") or login,
+                    balance=info["balance"],
+                    equity=info.get("equity"),
+                    account_mode=account_mode,
+                )
+
+                # Store currency in settings (flexible JSON — no schema change needed)
+                currency = info.get("currency", "")
+                if currency:
+                    existing = await mt5_repo.get_settings(user_id)
+                    if existing.get("account_currency") != currency:
+                        existing["account_currency"] = currency
+                        await mt5_repo.upsert_settings(user_id, existing)
+
+                logger.info(
+                    f"[balance-sync] ✓ user={user_id} attempt={attempt} "
+                    f"balance={info['balance']} {currency} broker={info.get('broker')}"
+                )
+                return  # success — stop retrying
+
+            logger.warning(
+                f"[balance-sync] attempt {attempt}/{max_attempts} for user={user_id}: "
+                f"connected={info.get('connected')} error={str(info.get('error',''))[:120]}"
+            )
+
+        except Exception as ex:
+            logger.warning(
+                f"[balance-sync] attempt {attempt}/{max_attempts} for user={user_id} raised: {ex}"
+            )
+
+    logger.error(
+        f"[balance-sync] all {max_attempts} attempts failed for user={user_id} "
+        f"metaapi_id={metaapi_id} — balance stays 0 until next refresh"
+    )
 
 
 # ── EA endpoints ───────────────────────────────────────────────────────────────
@@ -93,7 +170,6 @@ class MetaApiConnectPayload(BaseModel):
     name: str = 'RainaAI User'
     # Optional: the exact symbol as it appears on the user's MT5 terminal.
     # Used to auto-detect their broker's symbol suffix (e.g. "BTCUSDZ" → suffix "Z").
-    # If omitted, suffix defaults to "" (canonical symbols used for trading).
     sample_symbol: Optional[str] = None
 
 
@@ -101,22 +177,20 @@ class MetaApiConnectPayload(BaseModel):
 async def connect_metaapi(payload: MetaApiConnectPayload):
     """
     Provision the MetaAPI cloud account and return immediately.
-    user_id is derived from mt5_login — no Telegram ID needed.
-    The frontend polls GET /mt5/account/{user_id} for live status.
-
-    broker_symbol_suffix is auto-detected from sample_symbol if provided,
-    and stored so all trade orders use the user's exact broker symbol format.
+    A background coroutine starts retrying balance sync right away —
+    balance will appear on the dashboard within 1-3 minutes.
     """
-    from app.mt5.metaapi_client import provision_account, get_account_info
-    user_id = payload.mt5_login  # broker account number is unique per user
+    from app.mt5.metaapi_client import provision_account
 
-    # Detect broker symbol suffix from the sample symbol (e.g. BTCUSDZ → "Z")
+    user_id = payload.mt5_login
+
+    # Detect broker symbol suffix from sample symbol (e.g. BTCUSDZ → "Z")
     broker_suffix = ""
     if payload.sample_symbol:
         broker_suffix = detect_broker_suffix(payload.sample_symbol)
         logger.info(
-            f"Detected broker suffix '{broker_suffix}' from sample_symbol "
-            f"'{payload.sample_symbol}' for user {user_id}"
+            f"Detected broker suffix '{broker_suffix}' from '{payload.sample_symbol}' "
+            f"for user {user_id}"
         )
 
     try:
@@ -138,34 +212,21 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         broker_name=payload.mt5_server,
     )
 
-    # Persist broker suffix in settings so trade executor can look it up
+    # Persist broker suffix and initial settings
+    initial_settings = await mt5_repo.get_settings(user_id)
     if broker_suffix:
-        existing_settings = await mt5_repo.get_settings(user_id)
-        existing_settings["broker_symbol_suffix"] = broker_suffix
-        await mt5_repo.upsert_settings(user_id, existing_settings)
+        initial_settings["broker_symbol_suffix"] = broker_suffix
+    initial_settings["metaapi_id"] = metaapi_id
+    await mt5_repo.upsert_settings(user_id, initial_settings)
 
-    # Background task: wait for broker sync then update balance/equity
-    async def _sync_later():
-        try:
-            await asyncio.sleep(90)
-            info = await get_account_info(metaapi_id)
-            if info and info.get("connected"):
-                await mt5_repo.update_metaapi_heartbeat(
-                    metaapi_id=metaapi_id,
-                    broker=info.get("broker") or payload.mt5_server,
-                    account_number=info.get("login") or payload.mt5_login,
-                    balance=info.get("balance"),
-                    equity=info.get("equity"),
-                    account_mode=payload.account_mode,
-                )
-                logger.info(
-                    f"MetaAPI account {metaapi_id} synced for user {user_id} — "
-                    f"balance={info.get('balance')}"
-                )
-        except Exception as ex:
-            logger.warning(f"Background MetaAPI sync failed for {user_id}: {ex}")
-
-    asyncio.create_task(_sync_later())
+    # Start background balance sync — retries for up to ~90 min
+    asyncio.create_task(_sync_balance_with_retry(
+        metaapi_id=metaapi_id,
+        user_id=user_id,
+        account_mode=payload.account_mode,
+        broker_name=payload.mt5_server,
+        login=payload.mt5_login,
+    ))
 
     return {
         'connected': True,
@@ -176,6 +237,7 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         'account_number': payload.mt5_login,
         'account_mode': payload.account_mode,
         'broker_symbol_suffix': broker_suffix,
+        'balance_status': 'syncing',  # frontend shows a spinner until balance arrives
     }
 
 
@@ -183,35 +245,62 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
 
 @router.get('/account/{user_id}')
 async def get_account(user_id: str):
+    """
+    Return the stored MT5 account record immediately (fast path).
+    Balance is populated asynchronously by the background sync coroutine.
+    Use POST /mt5/balance/refresh/{user_id} to force a fresh sync.
+    """
     account = await mt5_repo.get_mt5_account(user_id)
     if not account:
         raise HTTPException(status_code=404, detail='Account not found')
 
-    # If balance is missing or zero and MetaAPI is provisioned, fetch it live.
-    # Hard cap at 12 s so the endpoint always returns quickly on Railway.
-    metaapi_id = account.get("metaapi_id")
-    stored_balance = account.get("balance")
-    if metaapi_id and (stored_balance is None or stored_balance == 0):
-        try:
-            from app.mt5.metaapi_client import get_account_info
-            info = await asyncio.wait_for(get_account_info(metaapi_id), timeout=12.0)
-            if info.get("connected") and info.get("balance"):
-                account = {**account, "balance": info["balance"], "equity": info.get("equity")}
-                # Persist so the next poll is instant
-                await mt5_repo.update_metaapi_heartbeat(
-                    metaapi_id=metaapi_id,
-                    broker=info.get("broker") or account.get("broker_name"),
-                    account_number=info.get("login") or account.get("account_number"),
-                    balance=info["balance"],
-                    equity=info.get("equity"),
-                    account_mode=account.get("account_mode", "demo"),
-                )
-        except asyncio.TimeoutError:
-            logger.warning(f"Live balance fetch timed out for {user_id} — returning stored value")
-        except Exception as e:
-            logger.warning(f"Live balance fetch failed for {user_id}: {e}")
+    # Enrich with account_currency from settings (stored during balance sync)
+    try:
+        settings_data = await mt5_repo.get_settings(user_id)
+        currency = settings_data.get("account_currency", "")
+        if currency and not account.get("currency"):
+            account = {**account, "currency": currency}
+    except Exception:
+        pass
 
     return account
+
+
+# ── Balance refresh (on-demand trigger) ───────────────────────────────────────
+
+@router.post('/balance/refresh/{user_id}')
+async def refresh_balance(user_id: str):
+    """
+    Trigger an immediate background balance re-fetch from MetaAPI.
+    Returns instantly — balance will update within 60-120 seconds.
+    The frontend should poll GET /mt5/account/{user_id} to see the updated value.
+    """
+    account = await mt5_repo.get_mt5_account(user_id)
+    if not account:
+        raise HTTPException(status_code=404, detail='Account not found')
+
+    metaapi_id = account.get("metaapi_id")
+    if not metaapi_id:
+        raise HTTPException(
+            status_code=400,
+            detail="MetaAPI not connected — balance sync only works for MetaAPI accounts"
+        )
+
+    # Fire-and-forget — balance will appear on next account poll
+    asyncio.create_task(_sync_balance_with_retry(
+        metaapi_id=metaapi_id,
+        user_id=user_id,
+        account_mode=account.get("account_mode", "demo"),
+        broker_name=account.get("broker_name", ""),
+        login=account.get("account_number", user_id),
+        max_attempts=3,  # On-demand: 3 quick attempts (90s → 120s → 180s)
+    ))
+
+    return {
+        "ok": True,
+        "message": "Balance sync started. Check back in 60-120 seconds.",
+        "metaapi_id": metaapi_id,
+    }
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -225,7 +314,6 @@ class SettingsPayload(BaseModel):
     daily_loss_limit: float = 5.0
     # Broker-specific symbol suffix — set once so trades use the right symbol.
     # Example: if your MT5 shows "BTCUSDZ", set suffix to "Z".
-    # Leave blank if your broker uses standard symbols (BTCUSD, XAUUSD, etc.).
     broker_symbol_suffix: str = ""
 
 
@@ -241,7 +329,7 @@ async def get_settings(user_id: str):
     return await mt5_repo.get_settings(user_id)
 
 
-# ── Scalping toggle (enable/disable background auto-scalping) ─────────────────
+# ── Scalping toggle ───────────────────────────────────────────────────────────
 
 class ScalpToggle(BaseModel):
     user_id: str
@@ -255,31 +343,22 @@ async def toggle_scalping(payload: ScalpToggle):
     return {"scalping_enabled": settings["scalping_enabled"]}
 
 
-# ── Scalping execute — immediately place a single trade via MetaAPI ────────────
+# ── Scalping execute ──────────────────────────────────────────────────────────
 
 class ScalpExecutePayload(BaseModel):
     user_id: str
-    symbol: str         # canonical OR broker-specific — we normalize either way
+    symbol: str
     direction: str      # "BUY" or "SELL"
     confidence: float = 70.0
-    # Optional override: exact broker symbol to use for this trade.
-    # If omitted, Raina AI looks up the user's stored broker_symbol_suffix
-    # and constructs the broker symbol automatically.
     broker_symbol_override: Optional[str] = None
 
 
 @router.post("/scalping/execute")
 async def execute_scalp_trade(payload: ScalpExecutePayload):
     """
-    Immediately execute a scalp trade for a specific user+signal via MetaAPI.
-    Called by the RainX app for Quick Scalp and Smart Scalp signal execution.
-
-    Symbol resolution:
-      1. If broker_symbol_override is set, use it directly.
-      2. Otherwise normalize the incoming symbol to canonical (BTCUSDZ → BTCUSD),
-         then re-apply the user's stored broker suffix (BTCUSD + Z → BTCUSDZ).
-      This ensures MetaAPI sends the exact symbol name the broker recognises,
-      regardless of what variant the frontend passes.
+    Execute a scalp trade via MetaAPI.
+    Symbol is normalised to canonical then re-suffixed with the user's stored
+    broker suffix, so the broker receives its exact symbol name.
     """
     from app.mt5.metaapi_client import place_trade
     from app.mt5.risk_calculator import calculate_lot_size
@@ -289,7 +368,6 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
     if direction not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="direction must be BUY or SELL")
 
-    # Look up the user's MT5 account
     account = await mt5_repo.get_mt5_account(payload.user_id)
     if not account:
         raise HTTPException(status_code=404, detail="MT5 account not found — connect first")
@@ -301,28 +379,23 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             detail="MetaAPI not connected — use EA mode or reconnect via MetaAPI"
         )
 
-    # Load risk settings (includes broker_symbol_suffix)
     settings_raw = await mt5_repo.get_settings(payload.user_id)
     risk_kwargs = {k: v for k, v in settings_raw.items() if k in RiskSettings.model_fields}
     settings = RiskSettings(**risk_kwargs)
 
-    # ── Resolve the exact broker symbol for this trade ────────────────────────
+    # Resolve broker symbol
     if payload.broker_symbol_override:
-        # Explicit override from frontend (most precise)
         broker_symbol = payload.broker_symbol_override
     else:
-        # Normalise the incoming symbol to canonical, then apply stored suffix
         canonical = normalize_for_data(payload.symbol.upper())
         stored_suffix = settings_raw.get("broker_symbol_suffix", "")
         broker_symbol = to_broker_symbol(canonical, stored_suffix)
 
     logger.info(
-        f"[execute] Symbol resolution: "
-        f"input={payload.symbol!r} → broker_symbol={broker_symbol!r} "
-        f"(suffix={settings_raw.get('broker_symbol_suffix', '')!r})"
+        f"[execute] user={payload.user_id} "
+        f"input={payload.symbol!r} → broker_symbol={broker_symbol!r}"
     )
 
-    # Confidence gate
     if payload.confidence < settings.min_confidence:
         raise HTTPException(
             status_code=400,
@@ -332,7 +405,6 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             )
         )
 
-    # Open trade count gate
     open_count = await mt5_repo.open_trade_count(payload.user_id)
     if open_count >= settings.max_open_trades:
         raise HTTPException(
@@ -340,14 +412,12 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             detail=f"Max open trades ({settings.max_open_trades}) already reached"
         )
 
-    # Daily loss gate
     if await mt5_repo.daily_loss_exceeded(payload.user_id, settings):
         raise HTTPException(status_code=400, detail="Daily loss limit reached — trading paused")
 
     balance = account.get("balance") or 1000.0
     lot = calculate_lot_size(broker_symbol, balance, settings, None)
 
-    # Insert a pending order record (store canonical symbol for internal tracking)
     canonical_for_record = normalize_for_data(payload.symbol.upper())
     api_key = account.get("api_key", "")
     order = TradeOrder(
@@ -362,11 +432,10 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
     )
     order_id = await mt5_repo.insert_trade_order(order)
 
-    # Place the trade via MetaAPI using the resolved broker symbol
     try:
         result = await place_trade(
             metaapi_id=metaapi_id,
-            symbol=broker_symbol,   # ← broker's exact symbol name
+            symbol=broker_symbol,
             direction=direction,
             lot_size=lot,
             stop_loss=None,
@@ -382,8 +451,8 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             result["ticket"], result.get("open_price", 0),
         )
         logger.info(
-            f"[execute] Trade opened for {payload.user_id}: "
-            f"{broker_symbol} {direction} lot={lot} ticket={result['ticket']}"
+            f"[execute] Trade opened: {broker_symbol} {direction} "
+            f"lot={lot} ticket={result['ticket']} user={payload.user_id}"
         )
         return {
             "ok": True,
