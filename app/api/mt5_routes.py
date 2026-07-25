@@ -10,13 +10,14 @@ EA endpoints (keyed by api_key, called by the MQL5 EA):
 
 Website sync endpoints:
   POST /mt5/connect/metaapi    — provision MetaAPI cloud account
-  GET  /mt5/account/{user_id}  — poll connection status
+  GET  /mt5/account/{user_id}  — poll connection status (fetches live balance when missing)
   POST /mt5/settings           — save risk settings
   GET  /mt5/settings/{user_id}
   GET  /mt5/trades/{user_id}
   GET  /mt5/history/{user_id}
   GET  /mt5/performance/{user_id}
-  POST /mt5/scalping/toggle
+  POST /mt5/scalping/toggle    — enable/disable background auto-scalping
+  POST /mt5/scalping/execute   — immediately execute a single scalp trade via MetaAPI
 """
 import asyncio
 import logging
@@ -117,15 +118,20 @@ async def connect_metaapi(payload: MetaApiConnectPayload):
         try:
             await asyncio.sleep(90)
             info = await get_account_info(metaapi_id)
-            if info:
-                await mt5_repo.upsert_mt5_account_full(
-                    user_id=user_id,
-                    account_mode=payload.account_mode,
+            if info and info.get("connected"):
+                # FIX: use update_metaapi_heartbeat so balance/equity are saved
+                await mt5_repo.update_metaapi_heartbeat(
                     metaapi_id=metaapi_id,
+                    broker=info.get("broker") or payload.mt5_server,
                     account_number=info.get("login") or payload.mt5_login,
-                    broker_name=info.get("broker") or payload.mt5_server,
+                    balance=info.get("balance"),
+                    equity=info.get("equity"),
+                    account_mode=payload.account_mode,
                 )
-                logger.info(f"MetaAPI account {metaapi_id} sync confirmed for user {user_id}")
+                logger.info(
+                    f"MetaAPI account {metaapi_id} synced for user {user_id} — "
+                    f"balance={info.get('balance')}"
+                )
         except Exception as ex:
             logger.warning(f"Background MetaAPI sync failed for {user_id}: {ex}")
 
@@ -149,6 +155,28 @@ async def get_account(user_id: str):
     account = await mt5_repo.get_mt5_account(user_id)
     if not account:
         raise HTTPException(status_code=404, detail='Account not found')
+
+    # If balance is missing or zero and MetaAPI is provisioned, fetch it live
+    metaapi_id = account.get("metaapi_id")
+    stored_balance = account.get("balance")
+    if metaapi_id and (stored_balance is None or stored_balance == 0):
+        try:
+            from app.mt5.metaapi_client import get_account_info
+            info = await get_account_info(metaapi_id)
+            if info.get("connected") and info.get("balance"):
+                account = {**account, "balance": info["balance"], "equity": info.get("equity")}
+                # Persist so the next poll is instant
+                await mt5_repo.update_metaapi_heartbeat(
+                    metaapi_id=metaapi_id,
+                    broker=info.get("broker") or account.get("broker_name"),
+                    account_number=info.get("login") or account.get("account_number"),
+                    balance=info["balance"],
+                    equity=info.get("equity"),
+                    account_mode=account.get("account_mode", "demo"),
+                )
+        except Exception as e:
+            logger.warning(f"Live balance fetch failed for {user_id}: {e}")
+
     return account
 
 
@@ -175,7 +203,7 @@ async def get_settings(user_id: str):
     return await mt5_repo.get_settings(user_id)
 
 
-# ── Scalping toggle ───────────────────────────────────────────────────────────
+# ── Scalping toggle (enable/disable background auto-scalping) ─────────────────
 
 class ScalpToggle(BaseModel):
     user_id: str
@@ -187,6 +215,123 @@ async def toggle_scalping(payload: ScalpToggle):
     settings["scalping_enabled"] = not settings.get("scalping_enabled", False)
     await mt5_repo.upsert_settings(payload.user_id, settings)
     return {"scalping_enabled": settings["scalping_enabled"]}
+
+
+# ── Scalping execute — immediately place a single trade via MetaAPI ────────────
+
+class ScalpExecutePayload(BaseModel):
+    user_id: str
+    symbol: str
+    direction: str   # "BUY" or "SELL"
+    confidence: float = 70.0
+
+
+@router.post("/scalping/execute")
+async def execute_scalp_trade(payload: ScalpExecutePayload):
+    """
+    Immediately execute a scalp trade for a specific user+signal via MetaAPI.
+    Called by the RainX app for Quick Scalp and Smart Scalp signal execution.
+    """
+    from app.mt5.metaapi_client import place_trade
+    from app.mt5.risk_calculator import calculate_lot_size
+    from app.models.mt5 import TradeDirection, TradeOrder, RiskSettings
+
+    direction = payload.direction.upper()
+    if direction not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="direction must be BUY or SELL")
+
+    # Look up the user's MT5 account
+    account = await mt5_repo.get_mt5_account(payload.user_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found — connect first")
+
+    metaapi_id = account.get("metaapi_id")
+    if not metaapi_id:
+        raise HTTPException(
+            status_code=400,
+            detail="MetaAPI not connected — use EA mode or reconnect via MetaAPI"
+        )
+
+    # Load risk settings
+    settings_raw = await mt5_repo.get_settings(payload.user_id)
+    _risk_fields = {"risk_percent", "max_open_trades", "min_confidence",
+                    "daily_loss_limit", "max_daily_loss_percent"}
+    risk_kwargs = {k: v for k, v in settings_raw.items() if k in RiskSettings.model_fields}
+    settings = RiskSettings(**risk_kwargs)
+
+    # Confidence gate
+    if payload.confidence < settings.min_confidence:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Signal confidence {payload.confidence:.0f}% is below your minimum "
+                f"{settings.min_confidence:.0f}% — adjust Risk Settings to lower the threshold"
+            )
+        )
+
+    # Open trade count gate
+    open_count = await mt5_repo.open_trade_count(payload.user_id)
+    if open_count >= settings.max_open_trades:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max open trades ({settings.max_open_trades}) already reached"
+        )
+
+    # Daily loss gate
+    if await mt5_repo.daily_loss_exceeded(payload.user_id, settings):
+        raise HTTPException(status_code=400, detail="Daily loss limit reached — trading paused")
+
+    balance = account.get("balance") or 1000.0
+    lot = calculate_lot_size(payload.symbol, balance, settings, None)
+
+    # Insert a pending order record
+    api_key = account.get("api_key", "")
+    order = TradeOrder(
+        user_id=payload.user_id,
+        api_key=api_key,
+        asset=payload.symbol,
+        direction=TradeDirection(direction),
+        lot_size=lot,
+        confidence=payload.confidence,
+        timeframe="5m",
+    )
+    order_id = await mt5_repo.insert_trade_order(order)
+
+    # Place the trade via MetaAPI
+    try:
+        result = await place_trade(
+            metaapi_id=metaapi_id,
+            symbol=payload.symbol,
+            direction=direction,
+            lot_size=lot,
+            stop_loss=None,
+            take_profit=None,
+        )
+    except Exception as e:
+        await mt5_repo.mark_trade_failed(order_id, str(e))
+        raise HTTPException(status_code=502, detail=f"MetaAPI trade error: {e}")
+
+    if result.get("success"):
+        await mt5_repo.update_trade_opened(
+            api_key, order_id,
+            result["ticket"], result.get("open_price", 0),
+        )
+        logger.info(
+            f"[execute] Trade opened for {payload.user_id}: "
+            f"{payload.symbol} {direction} lot={lot} ticket={result['ticket']}"
+        )
+        return {
+            "ok": True,
+            "ticket": result["ticket"],
+            "lot_size": lot,
+            "open_price": result.get("open_price"),
+        }
+    else:
+        await mt5_repo.mark_trade_failed(order_id, result.get("error", ""))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Trade rejected by broker: {result.get('error', 'Unknown error')}"
+        )
 
 
 # ── Trades ────────────────────────────────────────────────────────────────────
