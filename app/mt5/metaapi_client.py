@@ -65,10 +65,13 @@ async def get_account_info(metaapi_id: str) -> dict:
     try:
         api = _get_api()
         account = await api.metatrader_account_api.get_account(metaapi_id)
-        await account.deploy()
+        # Only deploy if not already deployed — avoids slow re-deploy on every poll
+        state = getattr(account, "state", None)
+        if state not in ("DEPLOYED", "DEPLOYING"):
+            await account.deploy()
         conn = account.get_rpc_connection()
         await conn.connect()
-        await conn.wait_synchronized({"timeoutInSeconds": 30})
+        await conn.wait_synchronized({"timeoutInSeconds": 10})
         info = await conn.get_account_information()
         await conn.close()
         return {
@@ -76,6 +79,7 @@ async def get_account_info(metaapi_id: str) -> dict:
             "equity": info.get("equity"),
             "broker": info.get("broker"),
             "server": info.get("server"),
+            "login": info.get("login"),
             "connected": True,
         }
     except Exception as e:

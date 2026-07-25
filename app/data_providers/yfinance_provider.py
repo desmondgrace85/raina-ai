@@ -35,20 +35,31 @@ _SYMBOL_MAP: dict[str, str] = {
     "NZDUSD":   "NZDUSD=X",
     "GBPJPY":   "GBPJPY=X",
     "EURJPY":   "EURJPY=X",
-    # Crypto
+    # Crypto (both USD and USDT variants)
     "BTCUSD":   "BTC-USD",
+    "BTCUSDT":  "BTC-USD",
     "ETHUSD":   "ETH-USD",
+    "ETHUSDT":  "ETH-USD",
     "BNBUSD":   "BNB-USD",
+    "BNBUSDT":  "BNB-USD",
     "SOLUSD":   "SOL-USD",
+    "SOLUSDT":  "SOL-USD",
     "XRPUSD":   "XRP-USD",
+    "XRPUSDT":  "XRP-USD",
     "ADAUSD":   "ADA-USD",
+    "ADAUSDT":  "ADA-USD",
+    "DOGEUSD":  "DOGE-USD",
+    "DOGEUSDT": "DOGE-USD",
     # Gold & metals
     "XAUUSD":   "GC=F",
     "XAGUSD":   "SI=F",
+    "SILVER":   "SI=F",
     # Commodities
     "WTICOUSD": "CL=F",
-    "BRENTUSD":  "BZ=F",
+    "USOIL":    "CL=F",
+    "BRENTUSD": "BZ=F",
     "NATGAS":   "NG=F",
+    "COPPER":   "HG=F",
 }
 
 # yfinance interval for each Raina timeframe (4h resampled from 1h)

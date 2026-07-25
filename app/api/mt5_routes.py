@@ -156,13 +156,14 @@ async def get_account(user_id: str):
     if not account:
         raise HTTPException(status_code=404, detail='Account not found')
 
-    # If balance is missing or zero and MetaAPI is provisioned, fetch it live
+    # If balance is missing or zero and MetaAPI is provisioned, fetch it live.
+    # Hard cap at 12 s so the endpoint always returns quickly on Railway.
     metaapi_id = account.get("metaapi_id")
     stored_balance = account.get("balance")
     if metaapi_id and (stored_balance is None or stored_balance == 0):
         try:
             from app.mt5.metaapi_client import get_account_info
-            info = await get_account_info(metaapi_id)
+            info = await asyncio.wait_for(get_account_info(metaapi_id), timeout=12.0)
             if info.get("connected") and info.get("balance"):
                 account = {**account, "balance": info["balance"], "equity": info.get("equity")}
                 # Persist so the next poll is instant
@@ -174,6 +175,8 @@ async def get_account(user_id: str):
                     equity=info.get("equity"),
                     account_mode=account.get("account_mode", "demo"),
                 )
+        except asyncio.TimeoutError:
+            logger.warning(f"Live balance fetch timed out for {user_id} — returning stored value")
         except Exception as e:
             logger.warning(f"Live balance fetch failed for {user_id}: {e}")
 
