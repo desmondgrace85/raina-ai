@@ -49,9 +49,24 @@ def _now() -> str:
     return datetime.utcnow().isoformat()
 
 
+def _is_table_missing(r: httpx.Response) -> bool:
+    """Return True when Supabase PostgREST can't find the table (PGRST205)."""
+    if r.status_code == 404:
+        try:
+            return r.json().get("code") == "PGRST205"
+        except Exception:
+            return True
+    return False
+
+
 async def _get(table: str, params: dict) -> list[dict]:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(_url(table), headers=_headers(), params=params)
+        if _is_table_missing(r):
+            logger.warning(
+                "Supabase table '%s' not found — run migrations/001_mt5_tables.sql", table
+            )
+            return []
         r.raise_for_status()
         return r.json()
 
@@ -62,6 +77,11 @@ async def _post(table: str, data: dict, upsert: bool = False) -> list[dict]:
         headers["Prefer"] = "resolution=merge-duplicates,return=representation"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(_url(table), headers=headers, json=data)
+        if _is_table_missing(r):
+            logger.warning(
+                "Supabase table '%s' not found — run migrations/001_mt5_tables.sql", table
+            )
+            return []
         r.raise_for_status()
         return r.json()
 
@@ -69,6 +89,11 @@ async def _post(table: str, data: dict, upsert: bool = False) -> list[dict]:
 async def _patch(table: str, params: dict, data: dict) -> list[dict]:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.patch(_url(table), headers=_headers(), params=params, json=data)
+        if _is_table_missing(r):
+            logger.warning(
+                "Supabase table '%s' not found — run migrations/001_mt5_tables.sql", table
+            )
+            return []
         r.raise_for_status()
         return r.json()
 
@@ -161,17 +186,18 @@ async def update_metaapi_heartbeat(metaapi_id: str, broker: str | None,
 
 async def mark_disconnected_stale(minutes: int = 5) -> None:
     cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
-    # Mark rows where last_heartbeat is older than cutoff OR null
     async with httpx.AsyncClient(timeout=10) as client:
         headers = _headers()
-        # Stale (old heartbeat)
-        await client.patch(_url("mt5_accounts"), headers=headers,
-                           params={"last_heartbeat": f"lt.{cutoff}"},
-                           json={"is_connected": False})
-        # Never had a heartbeat
-        await client.patch(_url("mt5_accounts"), headers=headers,
-                           params={"last_heartbeat": "is.null"},
-                           json={"is_connected": False})
+        r1 = await client.patch(_url("mt5_accounts"), headers=headers,
+                                params={"last_heartbeat": f"lt.{cutoff}"},
+                                json={"is_connected": False})
+        if not _is_table_missing(r1):
+            r1.raise_for_status()
+        r2 = await client.patch(_url("mt5_accounts"), headers=headers,
+                                params={"last_heartbeat": "is.null"},
+                                json={"is_connected": False})
+        if not _is_table_missing(r2):
+            r2.raise_for_status()
 
 
 async def set_ea_mode(user_id: str) -> None:
@@ -198,28 +224,30 @@ async def upsert_settings(user_id: str, settings: dict) -> None:
 
 async def get_scalping_users() -> list[dict]:
     """Return connected users with scalping_enabled=true in their settings."""
-    # Fetch all accounts that are connected or have a metaapi_id
-    # then filter in Python for scalping_enabled (stored in JSON blob)
     async with httpx.AsyncClient(timeout=10) as client:
-        # Join isn't available in PostgREST without RPC, so fetch both tables
         acc_r = await client.get(
             _url("mt5_accounts"),
             headers=_headers(),
-            params={"is_connected": "eq.true", "select": "user_id,api_key,metaapi_id,balance,account_mode"},
+            params={"is_connected": "eq.true",
+                    "select": "user_id,api_key,metaapi_id,balance,account_mode"},
         )
+        if _is_table_missing(acc_r):
+            return []
         acc_r.raise_for_status()
         accounts = {a["user_id"]: a for a in acc_r.json()}
 
         if not accounts:
             return []
 
-        # Fetch settings for these users
         user_ids = ",".join(accounts.keys())
         set_r = await client.get(
             _url("mt5_settings"),
             headers=_headers(),
-            params={"user_id": f"in.({user_ids})", "select": "user_id,settings_json"},
+            params={"user_id": f"in.({user_ids})",
+                    "select": "user_id,settings_json"},
         )
+        if _is_table_missing(set_r):
+            return []
         set_r.raise_for_status()
         settings_map = {s["user_id"]: s["settings_json"] for s in set_r.json()}
 
@@ -335,9 +363,13 @@ async def open_trade_count(user_id: str) -> int:
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
             _url("mt5_trades"),
-            headers={**_headers(), "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"},
-            params={"user_id": f"eq.{user_id}", "status": "in.(open,pending,sent)"},
+            headers={**_headers(), "Prefer": "count=exact",
+                     "Range-Unit": "items", "Range": "0-0"},
+            params={"user_id": f"eq.{user_id}",
+                    "status": "in.(open,pending,sent)"},
         )
+        if _is_table_missing(r):
+            return 0
         content_range = r.headers.get("content-range", "0/0")
         try:
             return int(content_range.split("/")[1])
