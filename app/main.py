@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from app.api.routes import router, set_provider
 from app.api.chat import router as chat_router, set_provider as chat_set_provider
 from app.api.mt5_routes import router as mt5_router
+from app.api.test_page import router as test_router
 from app.config import settings
 from app.data_providers.base import DataProvider
 
@@ -32,8 +33,6 @@ app = FastAPI(
 
 def _build_provider() -> DataProvider:
     if settings.data_provider in ("yfinance", "multi"):
-        # MultiProvider uses Binance for crypto + Yahoo v8 for forex/gold.
-        # Works from Railway cloud IPs (yfinance alone is IP-blocked by Yahoo).
         from app.data_providers.multi_provider import MultiProvider
         return MultiProvider()
     if settings.data_provider == "mock":
@@ -44,7 +43,6 @@ def _build_provider() -> DataProvider:
 
 @app.on_event("startup")
 async def startup():
-    # Initialise signal history database
     from app.storage.database import init_db
     await init_db()
 
@@ -53,26 +51,22 @@ async def startup():
     chat_set_provider(provider)
     logger.info(f"Data provider: {settings.data_provider}")
 
-    # Start background scanner
     from app.scanner.background_scanner import start_background_scanner
     start_background_scanner(provider)
 
     import asyncio
 
-    # Keep-alive ping — prevents Replit from sleeping
     async def _keep_alive():
         import httpx, os
-        url = f"http://0.0.0.0:{os.getenv('PORT', 8000)}/health"
+        url = f"http://0.0.0.0:{os.getenv(chr(80)+chr(79)+chr(82)+chr(84), 8000)}/health"
         async with httpx.AsyncClient() as client:
             while True:
-                await asyncio.sleep(240)  # every 4 minutes
+                await asyncio.sleep(240)
                 try:
                     await client.get(url, timeout=5)
                 except Exception:
                     pass
     asyncio.create_task(_keep_alive())
-
-    # Start stale-connection sweeper (marks EA offline if no heartbeat)
 
     async def _stale_sweeper():
         from app.storage.mt5_repo import mark_disconnected_stale
@@ -81,7 +75,6 @@ async def startup():
             await mark_disconnected_stale(minutes=5)
     asyncio.create_task(_stale_sweeper())
 
-    # Start News Flow community news bot
     from app.news_bot.news_flow import start_news_flow
     start_news_flow()
 
@@ -101,6 +94,7 @@ async def shutdown():
 app.include_router(router)
 app.include_router(chat_router)
 app.include_router(mt5_router)
+app.include_router(test_router)
 
 from app.api.community_ai import router as community_ai_router
 app.include_router(community_ai_router)
@@ -122,3 +116,4 @@ async def root():
             "symbols": "/symbols",
         },
     }
+
