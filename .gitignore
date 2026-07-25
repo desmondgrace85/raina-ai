@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+
+# SQLite databases (ephemeral — recreated on startup)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Logs
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
