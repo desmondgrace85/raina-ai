@@ -64,6 +64,19 @@ async def scalp_signal(symbol: str, timeframe: str = Query(default="5m")):
     return await scalping_engine.generate_signal(get_provider(), canonical, timeframe)
 
 
+@router.get("/signals/quick/{symbol}")
+async def quick_scalp_signal(symbol: str):
+    """
+    Quick Scalp signal — pure 1m price velocity/momentum.
+    Always returns BUY or SELL immediately — never HOLD.
+    Used by the Quick Scalp mode in the RainX app to enter immediately
+    when a short-term momentum burst is detected.
+    """
+    from app.engines.quick_scalp_engine import generate_signal as quick_gen
+    canonical = normalize_for_data(symbol.upper())
+    return await quick_gen(get_provider(), canonical)
+
+
 @router.get("/scan/long-term", response_model=list[Signal])
 async def scan_long_term(
     only_actionable: bool = Query(default=False),

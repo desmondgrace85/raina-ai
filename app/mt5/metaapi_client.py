@@ -2,14 +2,14 @@
 MetaAPI cloud client — executes trades on users' MT5 accounts
 via the internet. No EA or VPS needed by the user.
 
-Each user connects their MT5 credentials once. MetaAPI provisions
-a cloud terminal that stays connected to their broker 24/7.
-
 Balance fetch strategy:
-  • wait_synchronized can take 60-180s for a fresh Exness/ICMarkets
-    deployment. The background poller retries with generous timeouts.
-  • The API endpoint (GET /mt5/account/{id}) only returns the stored
-    value (fast path). Balance is refreshed by the background poller.
+  • wait_synchronized MUST be called with timeout_in_seconds as a keyword
+    arg, NOT as a dict — the dict form silently uses a ~5s default.
+  • The background poller (_sync_balance_with_retry in mt5_routes.py)
+    retries with timeout_in_seconds=90 so Exness/ICMarkets demos have
+    enough time to fully deploy their terminal.
+  • GET /mt5/account/{id} only returns the stored value (fast path).
+    Balance is refreshed by the background poller.
 """
 import logging
 import os
@@ -52,7 +52,6 @@ async def provision_account(
         logger.info(f"Provisioned MetaAPI account {account.id} for login {mt5_login}")
         return account.id
     except Exception as e:
-        # If account already exists, try to find it by querying accounts list
         err = str(e).lower()
         if "already" in err or "duplicate" in err or "exists" in err:
             try:
@@ -73,45 +72,82 @@ async def get_account_info(
     """
     Get live account balance/equity from MetaAPI via RPC connection.
 
-    sync_timeout_seconds controls how long we wait for the broker to
-    synchronise after deploying the terminal. Use a large value (60-120s)
-    in background polling tasks and a small value (15s) for interactive
-    endpoints (knowing we'll fall back to the stored value).
+    IMPORTANT: wait_synchronized MUST use the timeout_in_seconds keyword arg.
+    Passing a dict like {"timeoutInSeconds": N} silently falls back to the SDK
+    default (~5 seconds) and always times out on Exness/ICMarkets demo accounts.
 
-    Fresh Exness/ICMarkets demo accounts typically need 30-90 seconds to
-    fully deploy, so the first background poll usually needs 60s+.
+    sync_timeout_seconds = 90 is the right value for background polling.
+    Exness demo terminals typically need 30-90 s to fully deploy.
     """
+    api = None
+    conn = None
     try:
         api = _get_api()
         account = await api.metatrader_account_api.get_account(metaapi_id)
 
-        # Only deploy if not already deployed — avoids slow re-deploy on every poll
         state = getattr(account, "state", None)
-        if state not in ("DEPLOYED", "DEPLOYING"):
-            logger.info(f"MetaAPI account {metaapi_id} is in state '{state}' — deploying…")
-            await account.deploy()
+        logger.info(f"[metaapi] account {metaapi_id} state={state}")
 
+        # Deploy if needed — UNDEPLOYED/UNDEPLOYING happen after Railway restarts
+        if state not in ("DEPLOYED", "DEPLOYING"):
+            logger.info(f"[metaapi] deploying account {metaapi_id} (state was '{state}')…")
+            await account.deploy()
+            # Wait up to 90 s for the deploy to complete
+            import asyncio
+            for _ in range(18):
+                await asyncio.sleep(5)
+                refreshed = await api.metatrader_account_api.get_account(metaapi_id)
+                state = getattr(refreshed, "state", None)
+                logger.info(f"[metaapi] post-deploy state={state}")
+                if state == "DEPLOYED":
+                    account = refreshed
+                    break
+            if state != "DEPLOYED":
+                return {
+                    "connected": False,
+                    "error": f"Account still in state '{state}' after deploy attempt",
+                }
+
+        # Open RPC connection with correct timeout keyword arg
         conn = account.get_rpc_connection()
         await conn.connect()
 
         try:
-            await conn.wait_synchronized({"timeoutInSeconds": sync_timeout_seconds})
+            # *** CRITICAL: use keyword arg, not a dict ***
+            await conn.wait_synchronized(timeout_in_seconds=sync_timeout_seconds)
             info = await conn.get_account_information()
+
+            # get_account_information() returns a dict OR an object — handle both
+            if hasattr(info, "get"):
+                balance  = info.get("balance")
+                equity   = info.get("equity")
+                broker   = info.get("broker")
+                server   = info.get("server")
+                login    = info.get("login")
+                currency = info.get("currency")
+            else:
+                balance  = getattr(info, "balance", None)
+                equity   = getattr(info, "equity", None)
+                broker   = getattr(info, "broker", None)
+                server   = getattr(info, "server", None)
+                login    = getattr(info, "login", None)
+                currency = getattr(info, "currency", None)
+
             result = {
-                "balance": info.get("balance"),
-                "equity": info.get("equity"),
-                "broker": info.get("broker"),
-                "server": info.get("server"),
-                "login": info.get("login"),
-                "currency": info.get("currency"),
+                "balance": balance,
+                "equity": equity,
+                "broker": broker,
+                "server": server,
+                "login": login,
+                "currency": currency,
                 "connected": True,
             }
             logger.info(
-                f"MetaAPI sync OK for {metaapi_id}: "
-                f"balance={result['balance']} currency={result.get('currency')} "
-                f"broker={result.get('broker')}"
+                f"[metaapi] ✓ sync OK for {metaapi_id}: "
+                f"balance={balance} currency={currency} broker={broker}"
             )
             return result
+
         finally:
             try:
                 await conn.close()
@@ -119,7 +155,10 @@ async def get_account_info(
                 pass
 
     except Exception as e:
-        logger.warning(f"get_account_info failed for {metaapi_id} (timeout={sync_timeout_seconds}s): {e}")
+        logger.warning(
+            f"[metaapi] get_account_info FAILED for {metaapi_id} "
+            f"(timeout={sync_timeout_seconds}s): {type(e).__name__}: {e}"
+        )
         return {"connected": False, "error": str(e)}
 
 
@@ -133,8 +172,8 @@ async def place_trade(
 ) -> dict:
     """
     Place a market order on the user's MT5 account via MetaAPI.
-    Returns dict with success, ticket, openPrice, error.
     """
+    conn = None
     try:
         api = _get_api()
         account = await api.metatrader_account_api.get_account(metaapi_id)
@@ -142,7 +181,8 @@ async def place_trade(
         await conn.connect()
 
         try:
-            await conn.wait_synchronized({"timeoutInSeconds": 30})
+            # 30 s is enough for trade execution — terminal is already deployed
+            await conn.wait_synchronized(timeout_in_seconds=30)
 
             kwargs = {"volume": lot_size, "comment": "RainaAI"}
             if stop_loss:
@@ -167,20 +207,22 @@ async def place_trade(
                 "open_price": result.get("openPrice"),
             }
         return {"success": False, "error": result.get("stringCode", "unknown")}
+
     except Exception as e:
-        logger.error(f"place_trade failed for {metaapi_id}: {e}")
+        logger.error(f"[metaapi] place_trade failed for {metaapi_id}: {type(e).__name__}: {e}")
         return {"success": False, "error": str(e)}
 
 
 async def close_trade(metaapi_id: str, ticket: str) -> dict:
     """Close a specific position by ticket."""
+    conn = None
     try:
         api = _get_api()
         account = await api.metatrader_account_api.get_account(metaapi_id)
         conn = account.get_rpc_connection()
         await conn.connect()
         try:
-            await conn.wait_synchronized({"timeoutInSeconds": 30})
+            await conn.wait_synchronized(timeout_in_seconds=30)
             result = await conn.close_position(ticket)
         finally:
             try:
@@ -189,7 +231,7 @@ async def close_trade(metaapi_id: str, ticket: str) -> dict:
                 pass
         return {"success": result.get("numericCode") == 10009}
     except Exception as e:
-        logger.error(f"close_trade failed: {e}")
+        logger.error(f"[metaapi] close_trade failed: {type(e).__name__}: {e}")
         return {"success": False, "error": str(e)}
 
 
@@ -201,4 +243,4 @@ async def remove_account(metaapi_id: str) -> None:
         await account.undeploy()
         await account.remove()
     except Exception as e:
-        logger.warning(f"remove_account failed: {e}")
+        logger.warning(f"[metaapi] remove_account failed: {type(e).__name__}: {e}")
