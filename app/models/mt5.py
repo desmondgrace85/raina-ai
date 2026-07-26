@@ -33,7 +33,8 @@ class RiskSettings(BaseModel):
     max_daily_loss_percent: float = Field(default=5.0, ge=1.0, le=50.0)
     scalping_enabled: bool = False
     account_mode: AccountMode = AccountMode.DEMO
-    min_confidence: float = Field(default=70.0, ge=60.0, le=95.0)
+    # Floor is 10 — Quick Scalp operates at 55%+ so any user setting works
+    min_confidence: float = Field(default=70.0, ge=10.0, le=99.0)
 
 
 class MT5Account(BaseModel):

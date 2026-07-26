@@ -351,6 +351,8 @@ class ScalpExecutePayload(BaseModel):
     direction: str      # "BUY" or "SELL"
     confidence: float = 70.0
     broker_symbol_override: Optional[str] = None
+    # "quick" skips the min_confidence gate — Quick Scalp always enters immediately
+    mode: str = "smart"
 
 
 @router.post("/scalping/execute")
@@ -396,12 +398,14 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
         f"input={payload.symbol!r} → broker_symbol={broker_symbol!r}"
     )
 
-    if payload.confidence < settings.min_confidence:
+    # Quick Scalp always enters immediately — confidence gate is for Smart Scalp only
+    if payload.mode != "quick" and payload.confidence < settings.min_confidence:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Signal confidence {payload.confidence:.0f}% is below your minimum "
-                f"{settings.min_confidence:.0f}% — adjust Risk Settings to lower the threshold"
+                f"{settings.min_confidence:.0f}% — adjust Risk Settings to lower the threshold, "
+                f"or switch to Quick Scalp mode which enters immediately"
             )
         )
 
