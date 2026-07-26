@@ -160,6 +160,64 @@ async def ea_heartbeat(payload: EAHeartbeat):
     return {"ok": True}
 
 
+# ── EA Desktop connect ────────────────────────────────────────────────────────
+
+class EAConnectPayload(BaseModel):
+    mt5_login: str = ""      # optional — user can leave blank, we use api_key as user_id
+    account_mode: str = "demo"
+
+
+@router.post("/connect/ea")
+async def connect_ea(payload: EAConnectPayload):
+    """
+    EA Desktop mode — creates (or retrieves) an account record and returns
+    the pre-configured API key. No MetaAPI cloud needed.
+    The user downloads the .mq5 EA file, installs it in MT5, and pastes
+    this key into the EA settings. The EA then polls and heartbeats.
+    """
+    import uuid
+    user_id = payload.mt5_login.strip() or str(uuid.uuid4().hex[:12])
+    api_key = await mt5_repo.upsert_mt5_account(user_id, payload.account_mode)
+    return {
+        "connected": True,
+        "user_id": user_id,
+        "api_key": api_key,
+        "account_mode": payload.account_mode,
+        "mode": "ea",
+        "message": "Download the EA file and install it in MetaTrader 5.",
+    }
+
+
+@router.get("/ea/download/{user_id}")
+async def download_ea(user_id: str):
+    """
+    Return a pre-configured MQL5 Expert Advisor file for this user.
+    The file has their API key and server URL embedded — just drag into MT5.
+    """
+    from fastapi.responses import Response
+    from app.mt5.ea_generator import generate_ea
+    import os
+
+    account = await mt5_repo.get_mt5_account(user_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found — connect first")
+
+    server_url = os.getenv(
+        "RAILWAY_PUBLIC_DOMAIN",
+        "https://raina-ai-production-b247.up.railway.app"
+    )
+    ea_code = generate_ea(api_key=account["api_key"], server_url=server_url)
+
+    return Response(
+        content=ea_code,
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="RainX_Scalper_{user_id[:8]}.mq5"',
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
 # ── MetaAPI (cloud) connect ───────────────────────────────────────────────────
 
 class MetaApiConnectPayload(BaseModel):
