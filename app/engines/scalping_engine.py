@@ -91,4 +91,22 @@ async def generate_signal(
     except Exception as e:
         logger.warning(f"[scalp] AI enhance skipped for {symbol}: {e}")
 
+    # Push actionable signals to subscribers
+    if sig.direction.value != "HOLD":
+        try:
+            import os, httpx as _httpx
+            from app.storage.supabase_push import push_signal_to_supabase, get_symbol_to_users
+            sym_users = await get_symbol_to_users()
+            target_users = sym_users.get(symbol.upper(), [])
+            if target_users:
+                await push_signal_to_supabase(sig, target_users, timeframe)
+            raina_url = os.getenv("RAINA_URL", "http://localhost:8000")
+            async with _httpx.AsyncClient(timeout=10) as _client:
+                await _client.post(
+                    f"{raina_url}/push/send",
+                    json={"symbol": symbol, "direction": sig.direction.value, "confidence": sig.confidence, "timeframe": timeframe},
+                )
+        except Exception as _push_err:
+            logger.warning(f"[scalp] Push failed for {symbol}: {_push_err}")
+
     return sig
