@@ -244,18 +244,87 @@ async def candle_series(
 _vapid_keys: dict | None = None
 
 
+async def _load_vapid_keys_async() -> bool:
+    """
+    Called once at app startup (async context). Loads or generates VAPID keys
+    and populates the in-memory cache. Returns True if keys are ready.
+    Priority: env vars → SQLite DB → auto-generate + save to DB.
+    """
+    global _vapid_keys
+    if _vapid_keys and _vapid_keys.get("private"):
+        return True
+    # 1. Env vars (set on Railway for permanent persistence)
+    private_key = os.getenv("VAPID_PRIVATE_KEY", "")
+    public_key = os.getenv("VAPID_PUBLIC_KEY", "")
+    if private_key and public_key:
+        _vapid_keys = {"private": private_key, "public": public_key}
+        logger.info("VAPID keys loaded from env vars")
+        return True
+    # 2. SQLite DB (async — this is the fix for the always-regenerate bug)
+    try:
+        import aiosqlite
+        from app.storage.database import DB_PATH
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            cur = await db.execute("SELECT value FROM kv_store WHERE key = 'vapid_public'")
+            pub_row = await cur.fetchone()
+            cur2 = await db.execute("SELECT value FROM kv_store WHERE key = 'vapid_private'")
+            priv_row = await cur2.fetchone()
+            db_pub = pub_row[0] if pub_row else ""
+            db_priv = priv_row[0] if priv_row else ""
+        if db_pub and db_priv:
+            _vapid_keys = {"private": db_priv, "public": db_pub}
+            logger.info("VAPID keys loaded from DB (persistent across restarts)")
+            return True
+    except Exception as e:
+        logger.warning(f"VAPID DB load failed: {e}")
+    # 3. Auto-generate and persist to DB
+    try:
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        priv = generate_private_key(SECP256R1())
+        pub = priv.public_key()
+        raw_pub = pub.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        pub_b64url = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
+        raw_priv = priv.private_numbers().private_value.to_bytes(32, "big")
+        priv_b64url = base64.urlsafe_b64encode(raw_priv).rstrip(b"=").decode()
+        _vapid_keys = {"private": priv_b64url, "public": pub_b64url}
+        logger.warning(
+            "VAPID keys auto-generated. Paste these into Railway env vars NOW to avoid regeneration:\n"
+            f"  VAPID_PUBLIC_KEY={pub_b64url}\n"
+            f"  VAPID_PRIVATE_KEY={priv_b64url}"
+        )
+        try:
+            import aiosqlite
+            from app.storage.database import DB_PATH as _DB_PATH
+            async with aiosqlite.connect(_DB_PATH) as db:
+                await db.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                await db.execute("INSERT OR REPLACE INTO kv_store (key, value) VALUES ('vapid_public', ?)", (pub_b64url,))
+                await db.execute("INSERT OR REPLACE INTO kv_store (key, value) VALUES ('vapid_private', ?)", (priv_b64url,))
+                await db.commit()
+            logger.info("VAPID keys saved to DB — will survive next restart")
+        except Exception as ex:
+            logger.warning(f"VAPID DB save failed: {ex}")
+        return True
+    except Exception as e:
+        logger.warning(f"VAPID key generation failed: {e}")
+        _vapid_keys = {"private": "", "public": ""}
+        return False
+
+
 def _get_vapid_keys() -> dict:
     """
-    Return VAPID key pair.
+    Return cached VAPID keys (populated at startup by _load_vapid_keys_async).
+    If somehow not loaded yet, returns empty dict — push will fail gracefully.
+    """
+    return _vapid_keys or {}
 
-    Priority:
-      1. In-memory cache (_vapid_keys)
-      2. VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY env vars (set these on Railway)
-      3. SQLite DB (kv_store table — persists across restarts without Railway env vars)
-      4. Auto-generate and save to DB for next restart
 
-    The public key MUST be base64url (not hex) — that is what browsers expect
-    when calling PushManager.subscribe({ applicationServerKey }).
+def _get_vapid_keys_sync_legacy() -> dict:
+    """
+    Legacy sync loader — only used as fallback if startup loader was skipped.
+    Priority: env vars only (no DB access in sync context).
     """
     global _vapid_keys
     if _vapid_keys:
@@ -265,35 +334,6 @@ def _get_vapid_keys() -> dict:
     if private_key and public_key:
         _vapid_keys = {"private": private_key, "public": public_key}
         return _vapid_keys
-    # Try to load from DB (persisted from a prior auto-generate run)
-    try:
-        import asyncio, aiosqlite
-        from app.storage.database import DB_PATH
-        async def _load_from_db():
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS kv_store (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL
-                    )
-                """)
-                cur = await db.execute("SELECT value FROM kv_store WHERE key = 'vapid_public'")
-                pub_row = await cur.fetchone()
-                cur2 = await db.execute("SELECT value FROM kv_store WHERE key = 'vapid_private'")
-                priv_row = await cur2.fetchone()
-                return (pub_row[0] if pub_row else ""), (priv_row[0] if priv_row else "")
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Can't await in sync context inside async loop — skip DB read; will generate
-            db_pub, db_priv = "", ""
-        else:
-            db_pub, db_priv = loop.run_until_complete(_load_from_db())
-        if db_pub and db_priv:
-            _vapid_keys = {"private": db_priv, "public": db_pub}
-            logger.info("VAPID keys loaded from DB (persistent across restarts)")
-            return _vapid_keys
-    except Exception as e:
-        logger.warning(f"VAPID DB load failed: {e}")
     # Auto-generate and attempt to persist in DB
     try:
         import base64

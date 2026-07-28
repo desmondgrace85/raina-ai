@@ -46,6 +46,10 @@ async def startup():
     from app.storage.database import init_db
     await init_db()
 
+    # Pre-load VAPID keys while we're in async context — fixes the always-regenerate bug
+    from app.api.routes import _load_vapid_keys_async
+    await _load_vapid_keys_async()
+
     provider = _build_provider()
     set_provider(provider)
     chat_set_provider(provider)

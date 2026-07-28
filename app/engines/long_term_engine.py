@@ -108,11 +108,17 @@ async def generate_signal(
             target_users = sym_users.get(symbol.upper(), [])
             if target_users:
                 await push_signal_to_supabase(sig, target_users, timeframe)
-            raina_url = os.getenv("RAINA_URL", "http://localhost:8000")
+            arrow = "🟢" if sig.direction.value == "BUY" else "🔴"
+            raina_url = os.getenv("RAINA_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
             async with _httpx.AsyncClient(timeout=10) as _client:
                 await _client.post(
                     f"{raina_url}/push/send",
-                    json={"symbol": symbol, "direction": sig.direction.value, "confidence": sig.confidence, "timeframe": timeframe},
+                    json={
+                        "symbol": symbol,
+                        "title": f"{arrow} {sig.direction.value} {symbol}",
+                        "body": f"{timeframe} signal · {sig.confidence:.0f}% confidence",
+                        "category": "trading",
+                    },
                 )
         except Exception as _push_err:
             logger.warning(f"[long_term] Push failed for {symbol}: {_push_err}")
