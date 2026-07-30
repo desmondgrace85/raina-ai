@@ -412,6 +412,8 @@ class ScalpExecutePayload(BaseModel):
     broker_symbol_override: Optional[str] = None
     # "quick" skips the min_confidence gate — Quick Scalp always enters immediately
     mode: str = "smart"
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
 
 @router.post("/scalping/execute")
@@ -500,6 +502,8 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
         asset=canonical_for_record,
         direction=TradeDirection(direction),
         lot_size=lot,
+        stop_loss=payload.stop_loss,
+        take_profit=payload.take_profit,
         confidence=payload.confidence,
         timeframe="5m",
         comment=f"RainX | {broker_symbol}",
@@ -512,8 +516,8 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
             symbol=broker_symbol,
             direction=direction,
             lot_size=lot,
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=payload.stop_loss,
+            take_profit=payload.take_profit,
         )
     except Exception as e:
         await mt5_repo.mark_trade_failed(order_id, str(e))
