@@ -184,16 +184,26 @@ async def place_trade(
             # 30 s is enough for trade execution — terminal is already deployed
             await conn.wait_synchronized(timeout_in_seconds=30)
 
-            kwargs = {"volume": lot_size, "comment": "RainaAI"}
-            if stop_loss:
-                kwargs["stopLoss"] = stop_loss
-            if take_profit:
-                kwargs["takeProfit"] = take_profit
+            # SDK v27+ signature: (symbol, volume, stop_loss=None, take_profit=None, options=None)
+            # 'comment' is NOT a supported parameter in SDK v27+ — it is already
+            # stored in RainaAI's own database via TradeOrder.comment so no data is lost.
+            # SL/TP must use the SDK's snake_case parameter names (stop_loss / take_profit),
+            # not the old camelCase keys (stopLoss / takeProfit) that the prior code used.
+            sl = stop_loss if stop_loss else None
+            tp = take_profit if take_profit else None
 
             if direction == "BUY":
-                result = await conn.create_market_buy_order(symbol, **kwargs)
+                result = await conn.create_market_buy_order(
+                    symbol, lot_size,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
             else:
-                result = await conn.create_market_sell_order(symbol, **kwargs)
+                result = await conn.create_market_sell_order(
+                    symbol, lot_size,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
         finally:
             try:
                 await conn.close()
