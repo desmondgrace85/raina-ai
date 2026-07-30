@@ -184,26 +184,37 @@ async def place_trade(
             # 30 s is enough for trade execution — terminal is already deployed
             await conn.wait_synchronized(timeout_in_seconds=30)
 
-            # SDK v27+ signature: (symbol, volume, stop_loss=None, take_profit=None, options=None)
-            # 'comment' is NOT a supported parameter in SDK v27+ — it is already
-            # stored in RainaAI's own database via TradeOrder.comment so no data is lost.
-            # SL/TP must use the SDK's snake_case parameter names (stop_loss / take_profit),
-            # not the old camelCase keys (stopLoss / takeProfit) that the prior code used.
-            sl = stop_loss if stop_loss else None
-            tp = take_profit if take_profit else None
-
+            # Place the market order WITHOUT SL/TP first.
+            # Passing stops on the initial order causes "Invalid stops" rejections
+            # when the market moves between signal generation and execution — the
+            # stops are calculated against the signal entry price, not the actual
+            # fill price.  We open first, then modify the position immediately
+            # after so the stops are applied against the real fill price.
             if direction == "BUY":
-                result = await conn.create_market_buy_order(
-                    symbol, lot_size,
-                    stop_loss=sl,
-                    take_profit=tp,
-                )
+                result = await conn.create_market_buy_order(symbol, lot_size)
             else:
-                result = await conn.create_market_sell_order(
-                    symbol, lot_size,
-                    stop_loss=sl,
-                    take_profit=tp,
-                )
+                result = await conn.create_market_sell_order(symbol, lot_size)
+
+            # If the order opened and we have SL/TP, apply them via modification
+            if result.get("numericCode") == 10009 and (stop_loss or take_profit):
+                position_id = result.get("orderId") or result.get("positionId")
+                if position_id:
+                    try:
+                        await conn.modify_position(
+                            str(position_id),
+                            stop_loss=stop_loss if stop_loss else None,
+                            take_profit=take_profit if take_profit else None,
+                        )
+                        logger.info(
+                            f"[metaapi] SL/TP set on position {position_id}: "
+                            f"sl={stop_loss} tp={take_profit}"
+                        )
+                    except Exception as mod_err:
+                        # Trade is open — don't fail the whole request over stops
+                        logger.warning(
+                            f"[metaapi] Trade opened (ticket {position_id}) but "
+                            f"SL/TP modification failed: {mod_err}"
+                        )
         finally:
             try:
                 await conn.close()
