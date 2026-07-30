@@ -377,6 +377,26 @@ async def open_trade_count(user_id: str) -> int:
             return len(r.json()) if r.status_code == 200 else 0
 
 
+async def open_trade_count_for_symbol(user_id: str, symbol: str) -> int:
+    """Count open/pending/sent trades for a specific symbol (canonical form)."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            _url("mt5_trades"),
+            headers={**_headers(), "Prefer": "count=exact",
+                     "Range-Unit": "items", "Range": "0-0"},
+            params={"user_id": f"eq.{user_id}",
+                    "asset": f"eq.{symbol}",
+                    "status": "in.(open,pending,sent)"},
+        )
+        if _is_table_missing(r):
+            return 0
+        content_range = r.headers.get("content-range", "0/0")
+        try:
+            return int(content_range.split("/")[1])
+        except Exception:
+            return len(r.json()) if r.status_code == 200 else 0
+
+
 async def daily_loss_exceeded(user_id: str, settings: RiskSettings) -> bool:
     today = datetime.utcnow().date().isoformat()
     rows = await _get("mt5_trades", {

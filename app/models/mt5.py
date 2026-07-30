@@ -30,6 +30,7 @@ class TradeStatus(str, Enum):
 class RiskSettings(BaseModel):
     risk_percent: float = Field(default=1.0, ge=0.1, le=10.0)
     max_open_trades: int = Field(default=3, ge=1, le=20)
+    max_trades_per_symbol: int = Field(default=2, ge=1, le=10)
     max_daily_loss_percent: float = Field(default=5.0, ge=1.0, le=50.0)
     scalping_enabled: bool = False
     account_mode: AccountMode = AccountMode.DEMO

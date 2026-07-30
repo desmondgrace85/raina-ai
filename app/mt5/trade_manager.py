@@ -28,6 +28,8 @@ async def queue_signal_for_all(signal: Signal) -> int:
             continue
         if await mt5_repo.open_trade_count(user["user_id"]) >= settings.max_open_trades:
             continue
+        if await mt5_repo.open_trade_count_for_symbol(user["user_id"], signal.asset) >= settings.max_trades_per_symbol:
+            continue
 
         balance = user.get("balance") or 1000.0
         sl_pips = None

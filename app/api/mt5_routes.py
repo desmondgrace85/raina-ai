@@ -367,6 +367,7 @@ class SettingsPayload(BaseModel):
     user_id: str
     risk_percent: float = 1.0
     max_open_trades: int = 3
+    max_trades_per_symbol: int = 2
     scalping_enabled: bool = False
     min_confidence: float = 70.0
     daily_loss_limit: float = 5.0
@@ -472,6 +473,17 @@ async def execute_scalp_trade(payload: ScalpExecutePayload):
         raise HTTPException(
             status_code=400,
             detail=f"Max open trades ({settings.max_open_trades}) already reached"
+        )
+
+    canonical_symbol = normalize_for_data(payload.symbol.upper())
+    symbol_count = await mt5_repo.open_trade_count_for_symbol(payload.user_id, canonical_symbol)
+    if symbol_count >= settings.max_trades_per_symbol:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Max trades per symbol ({settings.max_trades_per_symbol}) already reached "
+                f"for {canonical_symbol}"
+            )
         )
 
     if await mt5_repo.daily_loss_exceeded(payload.user_id, settings):
