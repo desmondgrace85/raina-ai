@@ -79,6 +79,27 @@ async def startup():
             await mark_disconnected_stale(minutes=5)
     asyncio.create_task(_stale_sweeper())
 
+    async def _trade_reconciler():
+        from app.storage.mt5_repo import reconcile_stale_open_trades
+        # Run once 30s after startup to clear any existing stuck trades
+        await asyncio.sleep(30)
+        try:
+            cleared = await reconcile_stale_open_trades(stale_hours=4)
+            if cleared:
+                logger.info("[trade-reconciler] Startup sweep cleared %d stale trade(s)", cleared)
+        except Exception as e:
+            logger.warning("[trade-reconciler] Startup sweep error: %s", e)
+        # Then repeat every 30 minutes
+        while True:
+            await asyncio.sleep(1800)
+            try:
+                cleared = await reconcile_stale_open_trades(stale_hours=4)
+                if cleared:
+                    logger.info("[trade-reconciler] Cleared %d stale trade(s)", cleared)
+            except Exception as e:
+                logger.warning("[trade-reconciler] Error: %s", e)
+    asyncio.create_task(_trade_reconciler())
+
     from app.news_bot.news_flow import start_news_flow
     start_news_flow()
 

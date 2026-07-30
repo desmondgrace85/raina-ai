@@ -425,3 +425,63 @@ async def cancel_user_pending_trades(user_id: str) -> int:
                          "status": "in.(pending,sent)"},
                         {"status": "cancelled"})
     return len(rows)
+
+
+async def reconcile_stale_open_trades(stale_hours: int = 4) -> int:
+    """
+    Auto-cleanup: finds trades stuck at open/sent/pending with no recent
+    activity and marks them closed or cancelled so they stop holding open-
+    trade slots.
+
+    Rules:
+      • pending/sent with no mt5_ticket older than 2 h → cancelled
+        (never reached the broker)
+      • open/sent with a ticket older than stale_hours h → closed
+        (broker settled it but we never received the confirmation)
+
+    Returns the number of rows updated.
+    """
+    now = datetime.now(timezone.utc)
+    no_ticket_cutoff = (now - timedelta(hours=2)).isoformat()
+    stale_cutoff = (now - timedelta(hours=stale_hours)).isoformat()
+    updated = 0
+
+    # 1. pending/sent trades with no ticket → cancelled
+    rows_no_ticket = await _get("mt5_trades", {
+        "status": "in.(pending,sent)",
+        "mt5_ticket": "is.null",
+        "created_at": f"lt.{no_ticket_cutoff}",
+        "select": "id",
+    })
+    for row in rows_no_ticket:
+        await _patch(
+            "mt5_trades",
+            {"id": f"eq.{row['id']}"},
+            {"status": "cancelled",
+             "comment": "auto-cancelled: no broker ticket after 2 h"},
+        )
+        updated += 1
+        logger.info("[stale-sweep] cancelled trade %s — no ticket after 2 h", row["id"])
+
+    # 2. open/sent trades with a ticket but stuck for stale_hours → closed
+    rows_stale = await _get("mt5_trades", {
+        "status": "in.(open,sent)",
+        "mt5_ticket": "not.is.null",
+        "created_at": f"lt.{stale_cutoff}",
+        "select": "id,mt5_ticket",
+    })
+    for row in rows_stale:
+        await _patch(
+            "mt5_trades",
+            {"id": f"eq.{row['id']}"},
+            {"status": "closed",
+             "closed_at": now.isoformat(),
+             "comment": f"auto-closed: stale open position after {stale_hours} h"},
+        )
+        updated += 1
+        logger.info(
+            "[stale-sweep] closed trade %s (ticket %s) — stale after %sh",
+            row["id"], row.get("mt5_ticket"), stale_hours,
+        )
+
+    return updated
