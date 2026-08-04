@@ -18,10 +18,13 @@ def analyze(candles: list[Candle], weight: float = 0.20) -> FactorResult:
     volumes = np.array([c.volume for c in candles])
     closes = np.array([c.close for c in candles])
 
-    # Skip if volume data is all zeros (common with some forex feeds)
+    # Skip if volume data is all zeros (common with some forex feeds).
+    # weight=0 here (not the passed-in weight) — this factor has nothing to
+    # say, so it must not dilute the agreement ratio / confidence for
+    # instruments whose data source never reports volume.
     if volumes.max() == 0:
-        return FactorResult(name="volume", score=0, weight=weight,
-                            reason="No volume data available for this instrument.")
+        return FactorResult(name="volume", score=0, weight=0,
+                            reason="No volume data available for this instrument — factor excluded from this signal.")
 
     avg_vol = volumes[-20:].mean()
     recent_vol = volumes[-5:].mean()

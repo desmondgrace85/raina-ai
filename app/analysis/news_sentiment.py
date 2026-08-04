@@ -34,11 +34,17 @@ async def analyze(
             f"[news] {symbol} score={score:.1f} "
             f"events={len(events)} headlines={len(headlines)}"
         )
+        # No events, no headlines, or a genuinely flat net score: this factor
+        # has no real opinion. Keeping full weight on a 0 score was diluting
+        # the agreement ratio on every ordinary day (only real news days
+        # would ever let confidence clear the 65-70% bar). Zero the weight
+        # instead so a quiet news day doesn't cap TA-only signals.
+        effective_weight = weight if (events or headlines) and abs(score) > 1e-6 else 0.0
         return FactorResult(
             name="news_sentiment",
             score=score,
-            weight=weight,
-            reason=explanation,   # ← was wrongly named 'explanation', must be 'reason'
+            weight=effective_weight,
+            reason=explanation if effective_weight else "No active news/economic events for this symbol — factor excluded from this signal.",
         )
     except Exception as e:
         logger.warning(f"news_sentiment factor failed for {symbol}: {e}")
