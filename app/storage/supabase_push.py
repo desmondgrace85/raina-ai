@@ -65,6 +65,22 @@ async def push_signal_to_supabase(sig: Any, target_users: list[str], timeframe: 
     direction = sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)
     now = datetime.now(timezone.utc).isoformat()
 
+    # Close out any previous still-active signal for this exact user+symbol+timeframe
+    # before pushing a new one — this was the actual gap causing stale/conflicting rows.
+    # A signal should persist until it resolves (TP/SL hit) or a genuinely new analysis
+    # replaces it — not silently pile up as duplicate "active" rows.
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            for uid in target_users:
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/user_signals",
+                    headers=_headers(),
+                    params={"user_id": f"eq.{uid}", "symbol": f"eq.{sig.asset}", "timeframe": f"eq.{timeframe}", "status": "eq.active"},
+                    json={"status": "replaced"},
+                )
+    except Exception as e:
+        logger.warning(f"Failed to close out previous active signal before push: {e}")
+
     signal_rows = []
     notif_rows = []
     for uid in target_users:
