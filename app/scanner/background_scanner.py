@@ -30,6 +30,31 @@ logger = logging.getLogger(__name__)
 _scheduler: AsyncIOScheduler | None = None
 
 
+def _is_market_open(symbol: str) -> bool:
+    """Mirror the frontend's market-hours check. Crypto trades ~24/7;
+    forex/metals are closed all Saturday, and Sun before 21:00 UTC /
+    Fri after 21:00 UTC. Without this, the scanner kept analysing and
+    pushing 'new' signals off stale weekend-closed price data."""
+    from datetime import datetime, timezone
+
+    sym = symbol.upper()
+    is_crypto = any(c in sym for c in ("BTC", "ETH", "SOL", "XRP", "DOGE", "USDT"))
+    if is_crypto:
+        return True
+
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # Monday=0 ... Sunday=6
+    hour = now.hour
+
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 6 and hour < 21:  # Sunday before 21:00 UTC
+        return False
+    if weekday == 4 and hour >= 21:  # Friday after 21:00 UTC
+        return False
+    return True
+
+
 async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
     """Run a full watchlist scan for the given timeframe and push qualifying signals."""
     from app.scanner import multi_market_scanner
@@ -65,6 +90,12 @@ async def _scan_and_push(provider: DataProvider, timeframe: str) -> None:
             row_id = await save_signal(sig, sent_telegram=False)
         except Exception as e:
             logger.warning(f"DB save failed: {e}")
+
+        # Market closed for this symbol (weekend/off-hours) — don't push a
+        # signal based on stale, unchanged closed-market data as if it's fresh
+        if not _is_market_open(sig.asset):
+            logger.debug(f"[{timeframe}] {sig.asset} — market closed, signal saved but not pushed")
+            continue
 
         # Only push signals that clear the confidence gate
         if sig.direction.value == "HOLD":
